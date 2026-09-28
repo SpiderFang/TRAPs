@@ -3,8 +3,11 @@
 實作只接受二維、軸對齊且近似 rectilinear 的公尺格網。速度梯度使用完整的
 中心差分 stencil；中心點、四個正交鄰點及必要的局部極小值鄰域只要有一格
 無效，就不產生導數或曲線採樣。這個保守規則刻意避免把海岸或缺值當成 0，
-也避免曲線穿過遮罩缺口。輸入是 `(row=y, column=x)` 陣列，`u/v` 的單位由
-上游 OCM schema 定義，輸出的應變率 `s1/s2` 單位為 `s⁻¹`。
+也避免曲線穿過遮罩缺口。若設定指定 `smoothing_radius_cells`（0–3 格），
+會先以 `_mask_safe_graph_diffusion` 對速度做限次的 mask-safe 四鄰接 graph
+diffusion，再計算應變率；擴散只沿有效海域格點的圖傳播，不會跨越陸地或
+缺值連通。輸入是 `(row=y, column=x)` 陣列，`u/v` 的單位由上游 OCM schema
+定義，輸出的應變率 `s1/s2` 單位為 `s⁻¹`。
 """
 
 from __future__ import annotations
@@ -78,8 +81,13 @@ def detect_snapshot(
 
     限制
     ------
-    目前只實作無平滑的中心差分。這不是把陸地或缺值補成 0；若設定指定平滑，
-    本函式會拒絕執行，待日後加入只在有效海域內的保守平滑後再放開。
+    `smoothing_radius_cells=0`（預設）時只做無平滑的中心差分。非零時，
+    `_mask_safe_graph_diffusion` 會在有效格點的四鄰接圖上執行對應迭代次數
+    的 explicit diffusion，作為只在有效海域內傳播的保守 geodesic 平滑；
+    這不是把陸地或缺值補成 0，海岸與缺值連通仍會被切斷，平滑後才進行應變
+    率差分。結果的 `qc_flags`、`smoothing_radius_cells`、
+    `smoothing_equivalent_sigma_m` 與 `smoothing_method` 會記錄實際套用的
+    平滑設定與等效尺度，供下游追蹤與敏感度分析使用。
     """
 
     if not isinstance(config, DetectionConfig):
