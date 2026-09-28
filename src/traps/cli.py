@@ -1914,6 +1914,13 @@ def build_parser() -> argparse.ArgumentParser:
     _add_input_arguments(render, source_required=False)
     _add_detection_arguments(render)
     render.set_defaults(handler=_run_render)
+
+    # 延遲匯入避免模組載入期的循環相依：period.py 在函式內才需要 cli 的已載入符號，
+    # 而 cli 模組本身在頂層完全不匯入 period，因此只有 build_parser() 執行時才建立
+    # 這個單向相依。既有五個子命令的參數與行為完全不變。
+    from . import period as _period
+
+    _period.register_subcommands(subparsers)
     return parser
 
 

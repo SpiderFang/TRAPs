@@ -108,6 +108,45 @@ cd /Users/mustlab/Workspace/TRAPs
 
 三種 CSV 的 JSON `table_kind` 分別為 `tidal_phase`、`trajectory`、`marine_debris`。各類別實際缺項與拒絕原因見圖組的 [`figure_availability.json`](outputs/pilot/literature_figures_four_area_4frames_v5_colorbar/figure_availability.json)。若提供四區圖組，潮相 CSV 要涵蓋四區全部有效站點，軌跡與海廢 CSV 則各區分別檢查時間與空間對齊。不可把共用 OCM 強迫的 Lagrangian 模型粒子稱為獨立漂流器驗證。
 
+### 全期流程（detect-shards → track-period → aggregate）
+
+`detect` 一次只處理單一 domain-month 並攤成一份 JSON catalog，無法跨月份接續；全期
+研究（4 流場區域 × 2024–2025 共 24 個月）改用三階段、可平行、可續跑的流程，本節只
+涵蓋已實作的前兩階段：
+
+```bash
+python -m traps detect-shards \
+  --surface-root "$OCM_SURFACE_ROOT" --domain-id hsinchu_cache_v3 --month 202401 \
+  --ocean-mask /path/to/analysis_ocean_mask_osm_coastline_v1.npy \
+  --output-dir "$SHARDS_ROOT/hsinchu_cache_v3/202401" --resume
+
+python -m traps track-period \
+  --shards-root "$SHARDS_ROOT/hsinchu_cache_v3" --domain-id hsinchu_cache_v3 \
+  --months 202401-202512 --output-dir "$TRACK_ROOT/hsinchu_cache_v3" --resume
+```
+
+`detect-shards` 對單一 domain-month 流式呼叫 `detect_snapshot`，寫出精簡的
+`snapshots.npz`（逐時 coverage／detection 計數與 packbits 化 valid mask）、
+`detections.npz`（逐 detection 的核心、曲線 ragged array、以 `curve_pass_cells` 算出的
+格點交會集合、以及固定整數表的停止原因）與 `grid_reference.npz`；`manifest.json`
+保留完整 provenance、`detection_config`、`min_coverage`、schema
+`traps.period.shard.v1`。輸出目錄必須是新的或空的；`--resume` 只在既有
+`_SUCCESS` 通過 manifest artifact SHA-256 全部核對時略過重算，否則清掉本命令已知
+會寫出的檔案後重做（例如任何 artifact 被竄改）。
+
+`track-period` 讀入同一個 domain 的多個月份 shard，先依月份時序串接、以 UTC 時刻
+做穩定排序，重複 UTC（月份交界常見）固定保留**較晚月份**的一列
+（`sort_and_deduplicate_prefer_last`，與 `OCM-SVD-Analysis`、
+`Lagrangian-Ensemble-Backtracking` 相同的正式研究期時間軸契約）；此步驟從不內插或
+補缺，只記錄缺口。之後以 `StreamingTracker` 逐月串流建立跨月份 Eulerian track，寫出
+`canonical_snapshots.npz`、`track_observations.npz`、`tracks.csv`、
+`tracking_summary.json` 與 schema `traps.period.track.v1` 的 `manifest.json`
+（含 canonical-axis 統計、缺口清單、逐份 shard manifest 的 SHA-256）。
+
+兩階段輸出的欄位命名與陣列 schema 刻意為**尚未實作**的第三階段（跨月份／跨區彙整，
+含站點出現率與壽命統計）保留完整證據鏈；`aggregate` 子命令仍是待辦事項，因此目前
+`track-period` 的輸出還不能直接當成完整的五站全期統計。
+
 ## 目前產物、驗證與限制
 
 需求 PDF、四篇文獻原件與紅框副本及來源清冊存於 [`data/literature/`](data/literature/README.md)；程式佇列與驗收界線見 [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md)，[模組流程圖與文獻圖型對照](docs/MODULE_FLOW_AND_FIGURE_AUDIT.md) 逐項標明已可試跑和有資料 gate 的圖型。本機四區各 24 時刻的上游 `trial_partial_month` 用於來源與海岸 sidecar 檢查；四區各取同一 2025-01-01 UTC 四時刻進行檢出，並以[海岸線與等高色條版圖組](outputs/pilot/literature_figures_four_area_4frames_v5_colorbar/figure_availability.json)及[單時刻圖](outputs/pilot/snapshot_a_20250101_t0100_v5_colorbar/snapshot_000000.png)核對 A–D 圖面。這些產物一律是 `PILOT_ONLY` 工程試算，不是 2024–2025 正式 TRAP 統計。全套測試 61 項通過，圖組 27 個 artifact 的 SHA-256 與來源 catalog、研究設計設定雜湊已核對；四區科學摘要 JSON、五站摘要及概念圖和前版位元組一致。正式資料全期計算、跨月份生命週期、跨參數 robust 分類、速度單位確認，以及獨立表層觀測與潮相對照仍未完成；不能據此宣稱海廢濃度或污染來源。
