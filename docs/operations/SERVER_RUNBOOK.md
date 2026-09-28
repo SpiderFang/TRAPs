@@ -168,7 +168,10 @@ scripts/run_traps_server.sh PREPARE
 - `.venv` 的 python 版本 ≥ 3.11，且能 `import traps`。
 - `/home` 可用空間 ≥ `TRAPS_MIN_FREE_GB`（預設 50 GB）。
 - 每個 domain 都有 `traps-local-data/.staged/<domain>.done`。
-- 每個 domain 都有 ocean mask sidecar（`.npy` + `.json`）。
+- 每個 domain 都有 ocean mask sidecar：`analysis_ocean_mask_coastline_corrected_v2.npy`，
+  加上 metadata JSON（`analysis_land_mask_coastline_corrected_v2.json` 或
+  `analysis_ocean_mask_coastline_corrected_v2.json` 其中之一即可；順序與
+  `ocm.py::_load_analysis_mask` 的候選順序一致）。
 - 沒有另一個 `run_traps_server.sh` 執行程序持有 `$TRAPS_RUNS/.lock`（用
   `flock` 實作；`DETECT`/`TRACK`/`AGGREGATE` 開始前也會做同樣的鎖檢查）。
 

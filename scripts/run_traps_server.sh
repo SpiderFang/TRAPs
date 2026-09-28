@@ -220,12 +220,19 @@ PYEOF
     fi
 
     check_name="domain ${domain} 有 ocean mask sidecar"
-    local mask_npy="${TRAPS_INPUTS}/ocean_masks/${domain}/analysis_ocean_mask_coastline_corrected_v2.npy"
-    local mask_json="${TRAPS_INPUTS}/ocean_masks/${domain}/analysis_ocean_mask_coastline_corrected_v2.json"
-    if [[ -f "${mask_npy}" && -f "${mask_json}" ]]; then
+    local mask_dir="${TRAPS_INPUTS}/ocean_masks/${domain}"
+    local mask_npy="${mask_dir}/analysis_ocean_mask_coastline_corrected_v2.npy"
+    # metadata 檔名以 ocm.py::_load_analysis_mask 的候選順序為準：上游產生器
+    # 以 analysis_land_mask_<tag>.json 作為兩張 mask 的共同 metadata，其次接受
+    # 與 ocean 檔同名的 JSON，最後才是同 stem 的 .json。
+    local mask_json_land="${mask_dir}/analysis_land_mask_coastline_corrected_v2.json"
+    local mask_json_ocean="${mask_dir}/analysis_ocean_mask_coastline_corrected_v2.json"
+    local mask_json_stem="${mask_dir}/analysis_ocean_mask_coastline_corrected_v2.json"
+    if [[ -f "${mask_npy}" ]] \
+        && { [[ -f "${mask_json_land}" ]] || [[ -f "${mask_json_ocean}" ]] || [[ -f "${mask_json_stem}" ]]; }; then
       check_pass "${check_name}"
     else
-      check_fail "${check_name}" "缺少 ${mask_npy} 或 ${mask_json}"
+      check_fail "${check_name}" "缺少 ${mask_npy}，或缺少 ${mask_json_land} / ${mask_json_ocean} 三者之一"
     fi
   done
 

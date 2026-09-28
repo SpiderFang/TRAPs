@@ -640,3 +640,83 @@ class TestRunTrapsServerShellScript:
         )
         assert result.returncode != 0
         assert "FAIL:" in result.stdout
+
+    def test_prepare_ocean_mask_check_accepts_land_mask_json(self, tmp_path: Path):
+        # export_ocean_masks.py（src/traps/ocean_mask.py）把兩張 mask 共用的
+        # metadata 寫成 analysis_land_mask_<tag>.json，而不是
+        # analysis_ocean_mask_<tag>.json；ocm.py::_load_analysis_mask 也是以
+        # analysis_land_mask_<tag>.json 為第一候選。PREPARE 的 sidecar 健檢必須
+        # 接受這個實際會存在的檔名，而不是只認 analysis_ocean_mask_<tag>.json。
+        workspace = tmp_path / "workspace"
+        repo = workspace / "traps-repo"
+        inputs = workspace / "traps-inputs"
+        local_data = workspace / "traps-local-data"
+        runs = workspace / "traps-runs"
+        domain = "synthetic_domain"
+
+        # 一個乾淨、已 commit 的最小 git repo 頂層。
+        repo.mkdir(parents=True)
+        (repo / "README.md").write_text("fake repo for PREPARE test\n")
+
+        # .venv python：用目前跑測試的 interpreter 冒充，靠 PYTHONPATH 讓它能
+        # `import traps`（真正的 SETUP 會建立獨立 venv 並 pip install，這裡不需
+        # 要重現，只需要滿足 PREPARE 的健檢子行程）。建在 git commit 之前，讓它
+        # 跟 README 一起進到 commit，維持「工作目錄乾淨」那項健檢通過。
+        venv_py = repo / ".venv" / "bin" / "python"
+        venv_py.parent.mkdir(parents=True)
+        venv_py.symlink_to(sys.executable)
+
+        git_env = dict(os.environ)
+        git_env.update(
+            {
+                "GIT_AUTHOR_NAME": "test",
+                "GIT_AUTHOR_EMAIL": "test@example.com",
+                "GIT_COMMITTER_NAME": "test",
+                "GIT_COMMITTER_EMAIL": "test@example.com",
+            }
+        )
+        for git_args in (
+            ["git", "init", "-q"],
+            ["git", "add", "-A"],
+            ["git", "commit", "-q", "-m", "init"],
+        ):
+            subprocess.run(git_args, cwd=repo, env=git_env, check=True)
+
+        # domain 已完成本機 staging。
+        (local_data / ".staged").mkdir(parents=True)
+        (local_data / ".staged" / f"{domain}.done").write_text("")
+
+        # ocean mask sidecar：只放 .npy 加上 analysis_land_mask_<tag>.json（上游
+        # export_ocean_masks.py 實際寫出的檔名），不放
+        # analysis_ocean_mask_<tag>.json。
+        mask_dir = inputs / "ocean_masks" / domain
+        mask_dir.mkdir(parents=True)
+        (mask_dir / "analysis_ocean_mask_coastline_corrected_v2.npy").write_bytes(b"")
+        (mask_dir / "analysis_land_mask_coastline_corrected_v2.json").write_text("{}")
+
+        src_root = Path(__file__).resolve().parents[1] / "src"
+        env = dict(os.environ)
+        env.update(
+            {
+                "TRAPS_WORKSPACE": str(workspace),
+                "TRAPS_REPO": str(repo),
+                "TRAPS_INPUTS": str(inputs),
+                "TRAPS_LOCAL_DATA": str(local_data),
+                "TRAPS_RUNS": str(runs),
+                "TRAPS_DOMAINS": domain,
+                "TRAPS_MONTHS": "202401",
+                "TRAPS_MIN_FREE_GB": "0",
+                "TRAPS_EXPECTED_GIT_COMMIT": "",
+                "PYTHONPATH": str(src_root),
+            }
+        )
+
+        result = subprocess.run(
+            ["bash", str(_RUN_SERVER_SCRIPT), "PREPARE"],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "PASS: domain synthetic_domain 有 ocean mask sidecar" in result.stdout
+        assert "FAIL:" not in result.stdout
