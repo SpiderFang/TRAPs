@@ -1,0 +1,279 @@
+{
+  "schema_version": "1.0.0",
+  "annotation_method": "vector_red_rectangles_with_numbered_tags_and_front_guide",
+  "coordinate_system": "normalized_from_top_left",
+  "papers": [
+    {
+      "stem": "serra_haller_2016_oecs",
+      "title": "Serra 與 Haller（2016）｜OECS 理論",
+      "doi": "10.1063/1.4951720",
+      "source_url": "https://arxiv.org/pdf/1512.02112",
+      "version": "arXiv 作者預印本 v2（與 2016 年期刊論文對應）",
+      "rights": "作者預印本；引用及再利用時請核對來源頁面條款。",
+      "notes": "吸引型 OECS 的理論與數值示例；圖 10 不是臺灣海域結果。",
+      "original": "original/serra_haller_2016_oecs.pdf",
+      "annotated": "annotated/serra_haller_2016_oecs_marked.pdf",
+      "original_pages": 27,
+      "annotated_pages": 28,
+      "original_sha256": "02cd24d1bbfa6df2faf65da3c1822c6cdfe78a5c87a518565f041c35eb3bb35f",
+      "annotated_sha256": "c8ac3044d6df2cf0cfe6fa23ae311ddd5525a3ca4d59d81ad31bbc08f440957c",
+      "marks": [
+        {
+          "id": "A1",
+          "original_pdf_page": 4,
+          "marked_pdf_page": 5,
+          "bbox_fraction_tlbr": [
+            0.105,
+            0.205,
+            0.895,
+            0.307
+          ],
+          "takeaway_zh": "速度梯度的對稱部分定義應變率張量 S；本專案應在公尺座標求導並保留單位。"
+        },
+        {
+          "id": "A2",
+          "original_pdf_page": 4,
+          "marked_pdf_page": 5,
+          "bbox_fraction_tlbr": [
+            0.107,
+            0.384,
+            0.895,
+            0.465
+          ],
+          "takeaway_zh": "特徵值與特徵向量的排序、正交關係是 TRAP 核心及積分方向的測試依據。"
+        },
+        {
+          "id": "A3",
+          "original_pdf_page": 18,
+          "marked_pdf_page": 19,
+          "bbox_fraction_tlbr": [
+            0.11,
+            0.085,
+            0.9,
+            0.58
+          ],
+          "takeaway_zh": "圖 10：吸引骨架、流線及粒子短期變形並列，適合作為方法檢核圖型。"
+        }
+      ]
+    },
+    {
+      "stem": "serra_et_al_2020_traps_search_rescue",
+      "title": "Serra 等（2020）｜TRAP 現地驗證",
+      "doi": "10.1038/s41467-020-16281-x",
+      "source_url": "https://www.nature.com/articles/s41467-020-16281-x.pdf",
+      "version": "Nature Communications 期刊 PDF（已納入 2020 年更正）",
+      "rights": "CC BY 4.0；更正僅涉及參考文獻 17 的連結。",
+      "notes": "研究對象為海面漂流器與搜救模擬物；不能直接當成海廢濃度或本區域驗證。",
+      "original": "original/serra_et_al_2020_traps_search_rescue.pdf",
+      "annotated": "annotated/serra_et_al_2020_traps_search_rescue_marked.pdf",
+      "original_pages": 7,
+      "annotated_pages": 8,
+      "original_sha256": "8737ef4dbcb1d8417bf26859796d5141dff0a73d2aae59b0b51456b1f4f81820",
+      "annotated_sha256": "0bcd652d45ccdc6b918d476491d73080cfc7e146b1a431bc2ee8f4c821ae7054",
+      "marks": [
+        {
+          "id": "B1",
+          "original_pdf_page": 3,
+          "marked_pdf_page": 4,
+          "bbox_fraction_tlbr": [
+            0.065,
+            0.34,
+            0.95,
+            0.585
+          ],
+          "takeaway_zh": "圖 2：用核心、法向吸引和沿線輸送示意 TRAP 的物理意義。"
+        },
+        {
+          "id": "B2",
+          "original_pdf_page": 4,
+          "marked_pdf_page": 5,
+          "bbox_fraction_tlbr": [
+            0.07,
+            0.355,
+            0.945,
+            0.59
+          ],
+          "takeaway_zh": "圖 4：同時呈現 TRAP、實測漂流器、流線及散度，避免單靠流線判讀。"
+        },
+        {
+          "id": "B3",
+          "original_pdf_page": 4,
+          "marked_pdf_page": 5,
+          "bbox_fraction_tlbr": [
+            0.505,
+            0.605,
+            0.938,
+            0.727
+          ],
+          "takeaway_zh": "表 1：以漂流器至 TRAP 的距離均值和離散度作定量核對。"
+        },
+        {
+          "id": "B4",
+          "original_pdf_page": 5,
+          "marked_pdf_page": 6,
+          "bbox_fraction_tlbr": [
+            0.06,
+            0.065,
+            0.942,
+            0.465
+          ],
+          "takeaway_zh": "圖 5：將模型與 HFR 推得的 TRAP 和逐時漂流器位置並列。"
+        },
+        {
+          "id": "B5",
+          "original_pdf_page": 5,
+          "marked_pdf_page": 6,
+          "bbox_fraction_tlbr": [
+            0.505,
+            0.475,
+            0.938,
+            0.595
+          ],
+          "takeaway_zh": "表 2：逐時報告觀測距離；本專案如有獨立漂流器可依此設計。"
+        }
+      ]
+    },
+    {
+      "stem": "kunz_et_al_2024_traps_gpgp",
+      "title": "Kunz 等（2024）｜TRAP 空間與生命週期",
+      "doi": "10.5194/os-20-1611-2024",
+      "source_url": "https://os.copernicus.org/articles/20/1611/2024/os-20-1611-2024.pdf",
+      "version": "Ocean Science 期刊正式 PDF",
+      "rights": "CC BY 4.0。",
+      "notes": "資料為北太平洋中尺度、逐日 TRAP；其時間／空間門檻不可直接照搬至臺灣約 1 km 格網。",
+      "original": "original/kunz_et_al_2024_traps_gpgp.pdf",
+      "annotated": "annotated/kunz_et_al_2024_traps_gpgp_marked.pdf",
+      "original_pages": 20,
+      "annotated_pages": 21,
+      "original_sha256": "fe66309c5001fa54162d033219a5c609998eadebd6c55b7ae8198c03169ab479",
+      "annotated_sha256": "d6d9dc674c172cdbc671635b71e6ee1961301808644126e0b2a88dd2adac6580",
+      "marks": [
+        {
+          "id": "C1",
+          "original_pdf_page": 4,
+          "marked_pdf_page": 5,
+          "bbox_fraction_tlbr": [
+            0.49,
+            0.07,
+            0.932,
+            0.335
+          ],
+          "takeaway_zh": "圖 2：以 s1 底色、速度箭頭、核心與骨架建立單時刻標準示例。"
+        },
+        {
+          "id": "C2",
+          "original_pdf_page": 9,
+          "marked_pdf_page": 10,
+          "bbox_fraction_tlbr": [
+            0.065,
+            0.09,
+            0.94,
+            0.492
+          ],
+          "takeaway_zh": "圖 4：分圖呈現吸引強度、長壽命路徑、通過次數及平均壽命。"
+        },
+        {
+          "id": "C3",
+          "original_pdf_page": 9,
+          "marked_pdf_page": 10,
+          "bbox_fraction_tlbr": [
+            0.065,
+            0.5,
+            0.94,
+            0.765
+          ],
+          "takeaway_zh": "圖 5：壽命分布與生命週期；先追蹤同一結構，再解讀持續性。"
+        },
+        {
+          "id": "C4",
+          "original_pdf_page": 11,
+          "marked_pdf_page": 12,
+          "bbox_fraction_tlbr": [
+            0.065,
+            0.33,
+            0.938,
+            0.59
+          ],
+          "takeaway_zh": "圖 9：漂流器停留時間是物體指標，與 TRAP 特徵壽命分開。"
+        },
+        {
+          "id": "C5",
+          "original_pdf_page": 12,
+          "marked_pdf_page": 13,
+          "bbox_fraction_tlbr": [
+            0.07,
+            0.26,
+            0.94,
+            0.515
+          ],
+          "takeaway_zh": "圖 10：相對位置、速度箭頭與階段分組揭示吸引和沿線輸送。"
+        }
+      ]
+    },
+    {
+      "stem": "ghosh_et_al_2021_debris_lcs",
+      "title": "Ghosh 等（2021）｜海廢圖面參照",
+      "doi": "10.1016/j.scitotenv.2021.146808",
+      "source_url": "https://eprints.qut.edu.au/213199/1/98051748.pdf",
+      "version": "QUT 開放典藏之作者稿（非期刊排版版）",
+      "rights": "原件標示 CC BY-NC-ND 4.0；註記副本僅供本專案內部研究，勿對外散布。",
+      "notes": "本篇使用 backward FTLE／LCS，並非 TRAP；只借鏡統計呈現和觀測核對。",
+      "original": "original/ghosh_et_al_2021_debris_lcs.pdf",
+      "annotated": "annotated/ghosh_et_al_2021_debris_lcs_marked.pdf",
+      "original_pages": 41,
+      "annotated_pages": 42,
+      "original_sha256": "d4a63050834b130a6767bd61b2abe0a5fe39f1f9f96d163630dfa15faa6ada19",
+      "annotated_sha256": "467ebb566b4d6d8f46a1fb580dfafef5b778fb1d3d974ccef5884c37fd0c5804",
+      "marks": [
+        {
+          "id": "D1",
+          "original_pdf_page": 12,
+          "marked_pdf_page": 13,
+          "bbox_fraction_tlbr": [
+            0.08,
+            0.06,
+            0.93,
+            0.865
+          ],
+          "takeaway_zh": "圖 2：出現日數、熱點編號及歷史海廢資料並列；須另報有效日數分母。"
+        },
+        {
+          "id": "D2",
+          "original_pdf_page": 13,
+          "marked_pdf_page": 14,
+          "bbox_fraction_tlbr": [
+            0.1,
+            0.448,
+            0.9,
+            0.605
+          ],
+          "takeaway_zh": "正文：作者揭露海廢清理紀錄的取樣與頻率限制；觀測核對須載明偏差。"
+        },
+        {
+          "id": "D3",
+          "original_pdf_page": 16,
+          "marked_pdf_page": 17,
+          "bbox_fraction_tlbr": [
+            0.08,
+            0.14,
+            0.935,
+            0.542
+          ],
+          "takeaway_zh": "圖 3：漲潮與退潮分圖；本專案需先取得可信潮相資料。"
+        },
+        {
+          "id": "D4",
+          "original_pdf_page": 19,
+          "marked_pdf_page": 20,
+          "bbox_fraction_tlbr": [
+            0.078,
+            0.072,
+            0.935,
+            0.46
+          ],
+          "takeaway_zh": "圖 5：大潮與小潮分圖；僅借鏡條件分層，不能充作 TRAP 證據。"
+        }
+      ]
+    }
+  ]
+}

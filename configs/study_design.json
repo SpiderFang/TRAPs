@@ -1,0 +1,133 @@
+{
+  "schema_version": "1.0.0",
+  "project": "TRAPs",
+  "source_path_base": "project_root",
+  "statistics": {
+    "population_scope": "完整 flow domain",
+    "a_domain_partition": "以貢寮與龜山島 anchor 的公尺距離做互斥 Voronoi 分割，tie 歸貢寮",
+    "bcd_domain_partition": "各站使用完整 flow domain",
+    "surface_site_name_policy": "C 區顯示名稱為南灣；上游 flow_domain_id 保留 houwan_nmmba_cache_v3"
+  },
+  "source_references": [
+    {
+      "kind": "ocm_flow_domains",
+      "path": "../OCM-Data-Preprocessing/configs/ocm_flow_domains.json",
+      "sha256": "b8db61c38138d5690d203bf1b3785c6b2e581572d08f097573772c554ef373b3",
+      "description": "四個 OCM schema 3.0 flow-domain bbox 與產品 ID"
+    },
+    {
+      "kind": "lagrangian_study_sites",
+      "path": "../Lagrangian-Ensemble-Backtracking/configs/lagrangian_backtracking.formal_h30_h60_h90_m10.yaml",
+      "sha256": "c5c4fa78d2c1e116627815b9e3d15b65094aae5c85879ff20cd13e34d04e7d65",
+      "description": "五個 Lagrangian study site 的 anchor 與站名契約"
+    }
+  ],
+  "flow_domains": [
+    {
+      "analysis_region_id": "A",
+      "analysis_region_name_zh": "東北角海域",
+      "flow_domain_id": "northeast_taiwan_common_cache_v3",
+      "bbox_lon_lat": [
+        121.306315,
+        122.793685,
+        24.600844,
+        25.499156
+      ]
+    },
+    {
+      "analysis_region_id": "B",
+      "analysis_region_name_zh": "新竹外海",
+      "flow_domain_id": "hsinchu_cache_v3",
+      "bbox_lon_lat": [
+        119.70812,
+        121.19188,
+        24.300844,
+        25.199156
+      ]
+    },
+    {
+      "analysis_region_id": "C",
+      "analysis_region_name_zh": "南灣海域",
+      "flow_domain_id": "houwan_nmmba_cache_v3",
+      "bbox_lon_lat": [
+        120.16671,
+        121.62,
+        21.550844,
+        22.449156
+      ]
+    },
+    {
+      "analysis_region_id": "D",
+      "analysis_region_name_zh": "連江海域",
+      "flow_domain_id": "lienchiang_common_cache_v3",
+      "bbox_lon_lat": [
+        119.19912,
+        120.70088,
+        25.750844,
+        26.649156
+      ]
+    }
+  ],
+  "study_sites": [
+    {
+      "study_site_id": "gongliao",
+      "study_site_name_zh": "貢寮",
+      "analysis_region_id": "A",
+      "flow_domain_id": "northeast_taiwan_common_cache_v3",
+      "anchor_lonlat": [
+        121.9223889,
+        25.0964444
+      ],
+      "receptor_core_radius_m": 12500,
+      "local_domain_baseline_radius_m": 20000
+    },
+    {
+      "study_site_id": "guishan",
+      "study_site_name_zh": "龜山島西側",
+      "analysis_region_id": "A",
+      "flow_domain_id": "northeast_taiwan_common_cache_v3",
+      "anchor_lonlat": [
+        121.951606,
+        24.843127
+      ],
+      "receptor_core_radius_m": 12500,
+      "local_domain_baseline_radius_m": 20000
+    },
+    {
+      "study_site_id": "hsinchu",
+      "study_site_name_zh": "新竹外海",
+      "analysis_region_id": "B",
+      "flow_domain_id": "hsinchu_cache_v3",
+      "anchor_lonlat": [
+        120.45,
+        24.75
+      ],
+      "receptor_core_radius_m": 12500,
+      "local_domain_policy": "same_as_flow_domain"
+    },
+    {
+      "study_site_id": "nanwan",
+      "study_site_name_zh": "南灣",
+      "analysis_region_id": "C",
+      "flow_domain_id": "houwan_nmmba_cache_v3",
+      "anchor_lonlat": [
+        120.763161,
+        21.946577
+      ],
+      "receptor_core_radius_m": 12500,
+      "local_domain_policy": "same_as_flow_domain"
+    },
+    {
+      "study_site_id": "lienchiang",
+      "study_site_name_zh": "連江",
+      "analysis_region_id": "D",
+      "flow_domain_id": "lienchiang_common_cache_v3",
+      "anchor_lonlat": [
+        119.95,
+        26.2
+      ],
+      "receptor_core_radius_m": 12500,
+      "local_domain_policy": "same_as_flow_domain"
+    }
+  ]
+}
