@@ -13,9 +13,9 @@ detect/track/aggregate，以及把結果發布出去。
 - 目的：讓 TRAPs（四流場區域 × 五研究站的 TRAP 短期吸引潛勢分析）可以在 SERVER
   上批次跑完 2024-01 到 2025-12、四個 domain 的 detect → track → aggregate，並
   留下可追溯的 log 與 manifest。
-- 範圍只涵蓋「部署與批次執行工具」（work package WP-C）；detect-shards /
-  track-period 兩個 CLI 子指令的演算法邏輯由另一個工作項目負責，本手冊只描述
-  怎麼呼叫它們。
+- 範圍只涵蓋「部署與批次執行工具」（work package WP-C）；`detect-shards` /
+  `track-period` / `aggregate` 三個 CLI 子指令的演算法邏輯由其他工作項目
+  （WP-B1、WP-B2）負責，本手冊只描述怎麼呼叫它們。
 - 本手冊模仿同一團隊下 LBT 專案在 SERVER 上已經驗證過的部署慣例（同一個
   `/home/mustlab/Workspace` 之下），TRAPs 沿用相同的目錄骨架與「本機優先、NAS
   只當來源」的原則。
@@ -235,14 +235,31 @@ log 在 `$TRAPS_RUNS/runs/$TRAPS_PARAM_ID/logs/track/<domain>.log`。預估耗�
 
 ### AGGREGATE
 
+TRACK 全部成功後才跑：
+
 ```bash
 scripts/run_traps_server.sh AGGREGATE
 ```
 
-呼叫 `$VENV_PY -m traps aggregate --track-root ... --detect-root ... --output-dir ... --param-id ... --resume`。
-**這個子指令目前尚未實作**（由另一個工作項目負責）；在那之前，`AGGREGATE`
-模式偵測到 `python -m traps aggregate --help` 失敗時，會印出清楚訊息並以
-exit code 2 結束，不會假裝成功。
+呼叫一次：
+
+```
+$VENV_PY -m traps aggregate \
+  --track-root $TRAPS_RUNS/runs/$TRAPS_PARAM_ID/track \
+  --detect-root $TRAPS_RUNS/runs/$TRAPS_PARAM_ID/detect \
+  --output-dir $TRAPS_RUNS/runs/$TRAPS_PARAM_ID/aggregate \
+  --param-id $TRAPS_PARAM_ID --resume
+```
+
+讀入四個 domain 的 `track-period` 輸出，核對四區共用同一組 `param_id`、
+`detection_config`、`tracking_config`、`min_coverage`、`state_label`（拒絕
+`PILOT_ONLY` 與正式資料混用），並重新核對每個 shard manifest 的 SHA-256。輸出
+五站 `site_statistics.csv`／`.json`（`receptor`／`domain_partition` 兩種空間範圍
+× `all`／四季／年份分層的出現率、核心強度、壽命統計）、`spatial/<domain>/` 逐格
+分布 `.npz`，以及五站摘要、季節、壽命 CCDF 與逐區空間四分圖 PNG。log 在
+`$TRAPS_RUNS/runs/$TRAPS_PARAM_ID/logs/aggregate.log`。預估耗時：讀入全部
+shard／track artifact 與逐月流式統計為主要成本，量級與 TRACK 相近（數十分鐘），
+實際隨資料量與 `--bootstrap-reps` 變動。
 
 ## 如何在失敗後續跑（resume）
 
@@ -273,8 +290,9 @@ log 檔全部在 `$TRAPS_RUNS/runs/<param_id>/logs/{detect,track}/`；
 `$TRAPS_RUNS/runs/<param_id>/detect_summary.tsv` 是 DETECT 的逐工作摘要。
 
 「成功」的定義：`DETECT` 每個 domain-month 的輸出目錄下有 `_SUCCESS` 標記；
-`TRACK` 每個 domain 的輸出目錄下有 `_SUCCESS` 標記；`AGGREGATE`（實作完成後）
-比照辦理。`--resume` 就是靠這些標記判斷哪些部分已經完成、不需要重跑。
+`TRACK` 每個 domain 的輸出目錄下有 `_SUCCESS` 標記；`AGGREGATE` 的單一輸出目錄
+下同樣有 `_SUCCESS` 標記。`--resume` 就是靠這些標記判斷哪些部分已經完成、不需要
+重跑。
 
 ## 發布結果
 
@@ -310,8 +328,6 @@ log 檔全部在 `$TRAPS_RUNS/runs/<param_id>/logs/{detect,track}/`；
 
 ## 已知限制 / 待補事項
 
-- `AGGREGATE` 的底層 `python -m traps aggregate` 子指令尚未實作；本手冊描述的
-  是介面，實際可用時間依該工作項目進度而定。
 - `TRAPS_UV_SOURCE`（NAS 上的 `uv` 執行檔）本身放在 NAS，理論上也可能被清
   理；`SETUP` 只在本機 `$TRAPS_RUNS/bin/uv` 不存在時才去讀它，一旦複製成功，
   之後的 `SETUP` 都不再依賴 NAS 上那份。如果兩邊都不見了，需要手動找一份新的

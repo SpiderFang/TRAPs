@@ -1154,6 +1154,12 @@ def register_subcommands(subparsers: argparse._SubParsersAction) -> None:
     track_period.add_argument("--resume", action="store_true")
     track_period.set_defaults(handler=run_track_period)
 
+    # Stage 3（跨月份／跨區彙整）在獨立模組 aggregate.py 實作；這裡只新增掛載，
+    # 不改動 detect-shards／track-period 既有的參數或行為。
+    from . import aggregate as _aggregate
+
+    _aggregate.register_subcommands(subparsers)
+
 
 __all__ = [
     "STOP_REASON_CODES",

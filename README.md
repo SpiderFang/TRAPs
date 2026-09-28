@@ -111,8 +111,7 @@ cd /Users/mustlab/Workspace/TRAPs
 ### 全期流程（detect-shards → track-period → aggregate）
 
 `detect` 一次只處理單一 domain-month 並攤成一份 JSON catalog，無法跨月份接續；全期
-研究（4 流場區域 × 2024–2025 共 24 個月）改用三階段、可平行、可續跑的流程，本節只
-涵蓋已實作的前兩階段：
+研究（4 流場區域 × 2024–2025 共 24 個月）改用三階段、可平行、可續跑的流程：
 
 ```bash
 python -m traps detect-shards \
@@ -123,7 +122,14 @@ python -m traps detect-shards \
 python -m traps track-period \
   --shards-root "$SHARDS_ROOT/hsinchu_cache_v3" --domain-id hsinchu_cache_v3 \
   --months 202401-202512 --output-dir "$TRACK_ROOT/hsinchu_cache_v3" --resume
+
+python -m traps aggregate \
+  --track-root "$TRACK_ROOT" --detect-root "$SHARDS_ROOT" \
+  --output-dir "$AGGREGATE_ROOT" --resume
 ```
+
+`aggregate`（`$TRACK_ROOT`／`$SHARDS_ROOT` 各自是四個 domain 子目錄的容器）是第三
+階段，計算五站全期出現率、核心吸引強度與 track 壽命統計，並輸出逐格空間分布：
 
 `detect-shards` 對單一 domain-month 流式呼叫 `detect_snapshot`，寫出精簡的
 `snapshots.npz`（逐時 coverage／detection 計數與 packbits 化 valid mask）、
@@ -143,9 +149,39 @@ python -m traps track-period \
 `tracking_summary.json` 與 schema `traps.period.track.v1` 的 `manifest.json`
 （含 canonical-axis 統計、缺口清單、逐份 shard manifest 的 SHA-256）。
 
-兩階段輸出的欄位命名與陣列 schema 刻意為**尚未實作**的第三階段（跨月份／跨區彙整，
-含站點出現率與壽命統計）保留完整證據鏈；`aggregate` 子命令仍是待辦事項，因此目前
-`track-period` 的輸出還不能直接當成完整的五站全期統計。
+前兩階段輸出的欄位命名與陣列 schema 是為 `aggregate` 保留的完整證據鏈；`aggregate`
+讀入所有 4 個 domain 的 `track-period` 輸出（`--allow-partial-domains` 可放寬為部分
+domain，缺席站點會明列於 manifest），核對四區共用同一組 `param_id`、
+`detection_config`、`tracking_config`、`min_coverage`、`state_label`（拒絕
+`PILOT_ONLY` 與正式資料混用），並重新核對每個 shard manifest 的 SHA-256（偵測
+`track-period` 完成後 shard 被竄改的情況）。
+
+站點統計分兩種空間範圍（`scope`）：`receptor`（PRIMARY，站點 anchor 12.5 km
+半徑 × `analysis_ocean_mask`；A 區貢寮／龜山島兩站 receptor 互斥）與
+`domain_partition`（沿用 `site_masks()` 的舊定義，即完整 flow-domain 的
+Voronoi／整域分割，作為對照）。每個 `site_id × scope × stratum`
+（`stratum` 為 `all`、四季 `DJF/MAM/JJA/SON`、以及實際出現的年份）輸出
+`site_statistics.csv`／`site_statistics.json`：有效快照分母、核心／強核心／曲線
+出現率與分子（強核心門檻是跨四區 pooled 核心 `s1` 的 `--strong-quantile`
+分位數，預設最強 10%，以 s⁻¹ 與 day⁻¹ 記入 manifest）、`mean_pass_cell_fraction`
+（三個出現率與此欄位均以 day-block bootstrap 給 95% CI）、核心強度統計
+（count/mean/median/p10）、面積標準化核心密度，以及未截尾 track 的壽命統計
+（mean/median/p90，`lifetime_seconds = duration_seconds + Δt`，與
+`track-period` 的 track 壽命慣例一致；track 依其首個落在遮罩內的觀測時間指派
+stratum）。`spatial/<domain>/spatial_<all|DJF|MAM|JJA|SON>.npz` 額外保留逐格
+（不分站點）的有效分母、核心／強核心頻率、曲線通過率、平均核心強度與平均未截尾
+壽命；沒有有效分母的格點固定是 `NaN`，不假裝是零。
+
+`--no-figures` 可略過圖面只留統計表；預設另外輸出 `five_site_summary.png`
+（receptor scope、全期，三個出現率含 CI、核心強度與壽命摘要）、
+`seasonal_occurrence.png`（逐站四季分組長條圖）、`lifetime_distribution.png`
+（逐站 track 壽命 CCDF，未截尾實線、含截尾虛線）與每區一張
+`spatial_<domain>.png`（曲線通過率、核心頻率、平均核心強度、平均壽命四分圖，
+海岸線疊圖與色條對齊沿用既有 `coastline.py`／`colorbar_layout.py`；四區色階
+上下限取全域 2–98 百分位共用，並記錄於 manifest 供比較）。輸出目錄同樣必須是
+新的或空的（或 `--resume`），manifest schema 為 `traps.period.aggregate.v1`。
+所有輸出仍保留輸入的 `state_label`／科學狀態，圖說與 JSON 一律標示
+「MODEL_ONLY 表層短期吸引潛勢」或 `PILOT_ONLY`，不是實測海廢濃度或污染來源。
 
 ## 目前產物、驗證與限制
 
