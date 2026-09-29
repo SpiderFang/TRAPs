@@ -217,7 +217,7 @@ def test_aggregate_end_to_end_wp_h(built_run, tmp_path: Path, fake_font) -> None
     assert all(r["prop_n_tracks"] != "" for r in all_rows) and all(r["prop_n_tracks"] == "" for r in rows if r["stratum"] != "all")
     assert any(int(r["prop_n_tracks"]) > 0 for r in all_rows)
     assert all(r["prop_stationary_frac"] != "" for r in all_rows if int(r["prop_n_tracks"]) > 0)
-    assert manifest["coastal_buffer_km"] == 3.0 and manifest["propagation"]["min_observations"] == 3
+    assert manifest["coastal_buffer_km"] == 10.0 and manifest["propagation"]["min_observations"] == 3
     assert manifest["core_subgrid"] == {"method": "quadratic_3x3", "refine": True}
     for site in ("nanwan", "gongliao", "guishan"):
         archive = np.load(out / "spatial" / site / "spatial_all.npz")

@@ -533,7 +533,7 @@ def test_coast_distance_field_on_synthetic_mask_matches_brute_force() -> None:
     assert field[6, 8] == pytest.approx(1000.0) and field[6, 10] == pytest.approx(1000.0)
     assert field[7, 10] == pytest.approx(np.hypot(1000.0, 1000.0), rel=1e-6)  # 對角格：最近非海域格點為孤島
     assert field[0, 3] == pytest.approx(3000.0)  # 只受西岸影響
-    assert np.allclose(field, _brute_force_coast_distance(mask, x_axis, y_axis, 30_000.0), atol=1e-2)
+    assert np.allclose(field, _brute_force_coast_distance(mask, x_axis, y_axis, 200_000.0), atol=1e-2)
 
     # 隨機遮罩、非等距且遞減的 y 軸；小 cap 會使遠處飽和（不是陸地）
     rng = np.random.default_rng(3)
@@ -610,7 +610,7 @@ def test_detect_shards_v2_columns_and_track_period_coast_distance(three_month_ro
         expected = sample_coast_distance(coast, grid["x_m_axis"], grid["y_m_axis"], archive["core_x_m"], archive["core_y_m"])
         assert np.allclose(archive["core_coast_distance_m"], expected, equal_nan=False)
         # 整格網都是海域（合成遮罩）：沒有非海域格點 → 飽和上限
-        assert np.all(coast == 30_000.0) == bool(np.all(grid["analysis_ocean_mask"]))
+        assert np.all(coast == 200_000.0) == bool(np.all(grid["analysis_ocean_mask"]))
         # 細化位置相對格點節點的偏移在 ±0.5 格內；未細化者等於節點
         spacing = float(np.median(np.diff(grid["x_m_axis"])))
         offset = np.hypot(archive["core_x_m"] - archive["core_grid_x_m"], archive["core_y_m"] - archive["core_grid_y_m"])

@@ -902,6 +902,8 @@ def render_long_tracks(
                 f"{T['long_coast_null']} {tracks.null_long_coastal_mean:.1f} {T['n_tracks']}，"
                 f"{T['long_coast_offshore']} {tracks.null_long_offshore_mean:.1f} {T['n_tracks']}（n_seed={tracks.null_n_seeds}）"
             )
+    if tracks.n_long_coastal_total is not None and tracks.n_long_offshore_total is not None:
+        extra_lines.append(T["coast_footnote"])
     full_footer = footer + "".join(f"\n{line}" for line in extra_lines)
     layout = _single_map_layout(data, view, full_footer, legend_height=0.0, max_width=7.0, max_height=6.0)
     figure = plt.figure(figsize=(layout["fig_w"], layout["fig_h"]))

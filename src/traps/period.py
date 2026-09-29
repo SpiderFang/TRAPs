@@ -59,8 +59,8 @@ LEGACY_SHARD_SCHEMA_VERSIONS = ("traps.period.shard.v1",)
 ACCEPTED_SHARD_SCHEMA_VERSIONS = (SHARD_SCHEMA_VERSION, *LEGACY_SHARD_SCHEMA_VERSIONS)
 """v2 新增次網格核心與近岸距離欄位；v1 shard 仍可讀，缺欄位以格點節點／即時計算補齊。"""
 
-COAST_DISTANCE_CAP_M = 30_000.0
-"""近岸距離場的飽和上限（m）；超過此距離的格點記為此值（近岸診斷只需數 km 至數十 km）。"""
+COAST_DISTANCE_CAP_M = 200_000.0
+"""近岸距離場的飽和上限（m）；超過此距離的格點記為此值（僅為速度防護，涵蓋整個 domain；舊 shard 為 30 km）。"""
 TRACK_SCHEMA_VERSION = "traps.period.track.v1"
 
 DEFAULT_PROGRESS_INTERVAL_SNAPSHOTS = 48

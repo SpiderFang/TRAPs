@@ -55,6 +55,8 @@ class CoastalDiagnosticData:
     null_offshore: Sequence[Sequence[float]] = ()
     null_coastal: Sequence[Sequence[float]] = ()
     nominal_step_hours: float = 1.0
+    cap_km: float | None = None  # 距離場飽和上限；None 視為直方圖最後邊界。舊 shard 為 30 km
+    detection_floor_km: float | None = None  # 站內合格核心的最小距岸距離（檢出下限）
 
 
 @dataclass
@@ -313,7 +315,7 @@ def _add_inch_axes(figure: Any, x: float, y: float, width: float, height: float)
 
 
 def coast_buffer_label(data: SiteFigureData) -> str:
-    """近岸緩衝帶圖例文字，例如「近岸 3 km 帶」。"""
+    """近岸緩衝帶圖例文字，例如「近岸 10 km 帶」。"""
 
     return f"{T['coast_buffer_prefix']} {float(data.coast_buffer_km):g} {T['coast_buffer_suffix']}"
 
@@ -740,30 +742,60 @@ def render_coastal_diagnostic(output_path: Path, data: SiteFigureData, *, footer
     diag = data.coastal
     assert diag is not None
     fig_w, fig_h = 13.0, 5.8
-    table_lines = [T["coast_type_note"]]
+    table_lines = [T["coast_type_note"], T["coast_footnote"]]
     figure, (left, right) = plt.subplots(1, 2, figsize=(fig_w, fig_h))
     figure.subplots_adjust(left=0.07, right=0.97, bottom=(_footer_height_inch(footer) + 0.95) / fig_h, top=1.0 - 1.05 / fig_h, wspace=0.25)
 
     edges = np.asarray(diag.hist_edges_km, dtype=np.float64)
+    # 「≥ 上限」溢位 bin：距離場飽和於 cap_km（新版含最後一格溢位 bin；舊 shard 為 30 km），
+    # 起自 cap 的所有 bin 併為一根明確標示的長條，不與前面的曲線混在一起（避免最後一格堆出假尖峰）。
+    cap_km = float(diag.cap_km) if diag.cap_km is not None else float(edges[-1])
+    cap_index = int(np.searchsorted(edges, cap_km - 1.0e-9))
+    cap_index = min(max(cap_index, 1), edges.size - 1)
+    cap_label = f"{T['coast_cap_label']} {cap_km:g} km"
     groups = (
         (diag.hist_all, T["coast_hist_all"], "#1b4965", "-"),
         (diag.hist_strong, T["coast_hist_strong"], "#c1121f", "-"),
         (diag.hist_long, T["coast_hist_long"], "#2a9d8f", "-"),
     )
     any_hist = False
+    x_max = 0.0
+    overflow_drawn = False
     for counts, label, colour, style in groups:
         counts = np.asarray(counts, dtype=np.float64)
         total = float(counts.sum())
         if total <= 0.0:
             continue
         any_hist = True
-        left.step(edges, np.append(counts / total, counts[-1] / total), where="post", color=colour, linestyle=style, linewidth=1.6, label=f"{label} (n={int(total)})")
+        body = counts[:cap_index] / total
+        overflow = float(counts[cap_index:].sum()) / total
+        body_edges = edges[: cap_index + 1]
+        left.step(body_edges, np.append(body, body[-1]), where="post", color=colour, linestyle=style, linewidth=1.6, label=f"{label} (n={int(total)})")
+        nonzero = np.nonzero(counts[:cap_index])[0]
+        x_max = max(x_max, float(edges[nonzero[-1] + 1]) if nonzero.size else 0.0)
+        if overflow > 0.0:
+            overflow_drawn = True
+            width = float(edges[cap_index + 1] - edges[cap_index])
+            left.bar(float(edges[cap_index]), overflow, width=width, align="edge", color=colour, alpha=0.35, hatch="//", edgecolor=colour, linewidth=0.6)
+            x_max = max(x_max, cap_km + width)
     left.axvline(float(diag.buffer_km), color=COAST_BUFFER_COLOUR, linestyle="--", linewidth=1.1, label=coast_buffer_label(data))
+    x_max = max(x_max, 3.0 * float(diag.buffer_km)) if not overflow_drawn else x_max
+    x_max = min(max(x_max, 1.0), cap_km + float(edges[cap_index + 1] - edges[cap_index]))
+    floor_km = diag.detection_floor_km
+    if floor_km is not None and any_hist and floor_km > 0.0:
+        left.axvspan(0.0, float(floor_km), color="#9e9e9e", alpha=0.25, linewidth=0, zorder=0)
+        left.annotate(
+            f"{T['coast_floor_a']} {float(floor_km):.1f} km{T['coast_floor_b']}",
+            xy=(float(floor_km), 0.97), xycoords=("data", "axes fraction"), xytext=(4, -2), textcoords="offset points",
+            ha="left", va="top", fontsize=7.5, color="#424242", wrap=True,
+        )
+    if overflow_drawn:
+        left.text(cap_km + 0.5 * float(edges[cap_index + 1] - edges[cap_index]), 0.0, cap_label, rotation=90, ha="center", va="bottom", fontsize=7.5, color="#424242")
     if any_hist:
         left.legend(fontsize=8, loc="upper right")
     else:
         left.text(0.5, 0.5, T["no_data"], ha="center", va="center", transform=left.transAxes)
-    left.set_xlim(float(edges[0]), float(edges[-1]))
+    left.set_xlim(0.0, x_max)
     left.set_xlabel(T["coast_dist_xlabel"])
     left.set_ylabel(T["coast_hist_ylabel"])
     left.set_title(T["coast_hist_title"], fontsize=10)

@@ -244,12 +244,12 @@ def _capture_texts(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, list[tupl
 def _coastal_data() -> aggregate_figures.SiteFigureData:
     data = _synthetic_figure_data()
     data.coast_distance_m = _coast_field_for(data)
-    data.coast_buffer_km = 3.0
-    edges = np.linspace(0.0, 30.0, 61)
+    data.coast_buffer_km = 10.0
+    edges = np.arange(0.0, 34.0, 2.0)  # 舊 shard：距離場飽和於 30 km，bin 15 為「≥ 30 km」溢位 bin
     rng = np.random.default_rng(4)
     data.coastal = aggregate_figures.CoastalDiagnosticData(
-        buffer_km=3.0, hist_edges_km=edges,
-        hist_all=rng.integers(1, 50, 60), hist_strong=rng.integers(0, 20, 60), hist_long=rng.integers(0, 10, 60),
+        buffer_km=10.0, hist_edges_km=edges, cap_km=30.0, detection_floor_km=2.6,
+        hist_all=rng.integers(1, 50, 16), hist_strong=rng.integers(0, 20, 16), hist_long=rng.integers(0, 10, 16),
         lifetimes_offshore=[3.0, 8.0, 14.0, 30.0], lifetimes_coastal=[5.0, 40.0, 90.0],
         null_offshore=[[2.0, 4.0, 9.0], [3.0, 6.0]], null_coastal=[[2.0, 3.0], [4.0]],
     )
@@ -350,8 +350,8 @@ def test_coastal_figures_glyphs_buffer_legend_and_line_styles(tmp_path: Path, mo
     assert not missing, sorted(missing)
     for key in [k for k in FIGURE_TEXT if k.startswith(("coast", "example_rule_", "propagation_", "long_coast", "later_", "coastal"))]:
         assert set(FIGURE_TEXT[key]) <= REQUIRED_FIGURE_GLYPHS, key
-    # 地圖圖例都有「近岸 3 km 帶」
-    label = f"{FIGURE_TEXT['coast_buffer_prefix']} 3 {FIGURE_TEXT['coast_buffer_suffix']}"
+    # 地圖圖例都有「近岸 10 km 帶」
+    label = f"{FIGURE_TEXT['coast_buffer_prefix']} 10 {FIGURE_TEXT['coast_buffer_suffix']}"
     for figure_name in (
         "site_gongliao_spatial.png", "site_gongliao_hotspots.png", "site_gongliao_example.png", "site_gongliao_method_comparison.png",
         "site_gongliao_long_tracks.png", "site_gongliao_track_density.png",
@@ -369,6 +369,10 @@ def test_coastal_figures_glyphs_buffer_legend_and_line_styles(tmp_path: Path, mo
     diag_texts = " ".join(texts_by_figure["site_gongliao_coastal_diagnostic.png"])
     for key in ("coast_hist_title", "coast_ccdf_title", "coast_hist_all", "coast_hist_strong", "coast_hist_long", "coast_offshore_real", "coast_coastal_null"):
         assert FIGURE_TEXT[key] in diag_texts, key
+    # 檢出下限標註與腳註；舊 shard 的最後一格以明確「≥ 30 km」標示
+    assert f"{FIGURE_TEXT['coast_floor_a']} 2.6 km{FIGURE_TEXT['coast_floor_b']}" in diag_texts
+    assert FIGURE_TEXT["coast_footnote"] in diag_texts and FIGURE_TEXT["coast_footnote"] in long_texts
+    assert f"{FIGURE_TEXT['coast_cap_label']} 30 km" in diag_texts
 
 
 @pytest.mark.filterwarnings("ignore")
@@ -509,7 +513,7 @@ def test_end_to_end_coastal_and_offshore_classification(coastal_run, tmp_path: P
     # 舊 (--coastal-buffer-km 未給) 預設 3 km
     default_out = tmp_path / "agg_default"
     assert agg.run_aggregate(_namespace(track_root, detect_root, default_out, no_figures=True)) == 0
-    assert _manifest(default_out)["coastal_buffer_km"] == 3.0
+    assert _manifest(default_out)["coastal_buffer_km"] == 10.0
 
 
 @pytest.mark.filterwarnings("ignore")
@@ -549,7 +553,7 @@ def test_end_to_end_figures_coastal_example_and_diagnostic(coastal_run, tmp_path
     with pytest.raises(ValueError, match="coastal-buffer-km"):
         agg.run_aggregate(_namespace(track_root, detect_root, tmp_path / "bad", coastal_buffer_km=-1.0))
     with pytest.raises(ValueError, match="coastal-buffer-km"):
-        agg.run_aggregate(_namespace(track_root, detect_root, tmp_path / "bad2", coastal_buffer_km=45.0))
+        agg.run_aggregate(_namespace(track_root, detect_root, tmp_path / "bad2", coastal_buffer_km=250.0))
 
 
 def test_cli_registers_coastal_and_prop_flags() -> None:
@@ -560,4 +564,17 @@ def test_cli_registers_coastal_and_prop_flags() -> None:
     args = parser.parse_args(["aggregate", "--track-root", "a", "--detect-root", "b", "--output-dir", "c", "--coastal-buffer-km", "5", "--prop-min-obs", "6"])
     assert args.coastal_buffer_km == 5.0 and args.prop_min_obs == 6
     defaults = parser.parse_args(["aggregate", "--track-root", "a", "--detect-root", "b", "--output-dir", "c"])
-    assert defaults.coastal_buffer_km == 3.0 and defaults.prop_min_obs == 3
+    assert defaults.coastal_buffer_km == 10.0 and defaults.prop_min_obs == 3
+
+
+def test_coast_hist_edges_cover_full_cap_with_overflow_bin_and_no_spike() -> None:
+    """直方圖範圍涵蓋整個距離場上限，末端另有溢位 bin；遠離海岸的核心不再全堆進 30 km 的最後一格。"""
+
+    from traps.period import COAST_DISTANCE_CAP_M
+
+    assert COAST_DISTANCE_CAP_M >= 200_000.0
+    edges = agg.COAST_HIST_EDGES_KM
+    assert edges[0] == 0.0 and edges[-2] == COAST_DISTANCE_CAP_M / 1000.0 and edges[-1] > edges[-2]
+    values = np.clip(np.array([1.0, 12.0, 45.0, 90.0, 150.0]), 0.0, edges[-1] - 1.0e-9)
+    counts = np.histogram(values, bins=edges)[0]
+    assert counts[-1] == 0 and counts[15] == 0 and counts.sum() == 5  # 30 km 處沒有堆積

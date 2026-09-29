@@ -94,11 +94,18 @@ LIFETIME_THRESHOLD_HOURS = (6.0, 12.0, 24.0)
 HOTSPOT_MIN_CELLS = 3
 """``--hotspot-min-cells`` 的預設值：圖面熱點連通塊最少格數（只影響圖面，不影響統計）。"""
 SECONDS_PER_DAY = 86_400.0
-COASTAL_BUFFER_KM = 3.0
-"""``--coastal-buffer-km`` 的預設值：近岸緩衝帶寬度（核心距最近非分析海域格點的距離）。"""
+COASTAL_BUFFER_KM = 10.0
+"""``--coastal-buffer-km`` 的預設值：近岸緩衝帶寬度（核心距最近非分析海域格點的距離）。
+
+核心的偵測需要完整有效的導數模板與局部極小鄰域，實際上不可能落在距非海域格點約 2.5–3 km 以內（檢出下限），
+故 3 km 緩衝帶只剔除核心本來就不存在的區域；強核心與長壽命 track 集中在 3–10 km，預設取 10 km 才真正檢驗近岸影響。"""
 PROP_MIN_OBS = 3
 """``--prop-min-obs`` 的預設值與下限：傳播速度線性擬合所需的最少觀測數。"""
-COAST_HIST_EDGES_KM = np.linspace(0.0, COAST_DISTANCE_CAP_M / 1000.0, 61)
+COAST_HIST_STEP_KM = 2.0
+LEGACY_COAST_CAP_M = 30_000.0
+"""舊 shard（v1／早期 v2）距離場的飽和上限。"""
+COAST_HIST_EDGES_KM = np.arange(0.0, COAST_DISTANCE_CAP_M / 1000.0 + 2.0 * COAST_HIST_STEP_KM, COAST_HIST_STEP_KM)
+"""距岸直方圖 bin 邊界：0 至距離場上限每 2 km 一格，最後多一格「≥ 上限」溢位 bin（含飽和值）。"""
 """近岸診斷圖直方圖的固定 bin 邊界（km）；超過距離場飽和上限的值落入最後一格。"""
 
 _KNOWN_TOP_LEVEL_NAMES = ("site_statistics.csv", "site_statistics.json", "manifest.json", "manifest.sha256", "_SUCCESS")
@@ -421,6 +428,7 @@ def _new_site_accumulator() -> dict[str, Any]:
         "coast_hist_all": np.zeros(COAST_HIST_EDGES_KM.size - 1, dtype=np.int64),
         "coast_hist_strong": np.zeros(COAST_HIST_EDGES_KM.size - 1, dtype=np.int64),
         "coast_hist_long": np.zeros(COAST_HIST_EDGES_KM.size - 1, dtype=np.int64),
+        "core_coast_min_m": float("inf"),  # 站內合格核心的最小距岸距離（檢出下限）
         "track_lifetimes_offshore": [],  # 未截尾 track，平均核心距岸不小於緩衝帶
         "track_lifetimes_coastal": [],  # 未截尾 track，平均核心距岸小於緩衝帶
         "long_track_n": 0,  # 站內出生、未截尾、壽命 >= 長壽命門檻
@@ -570,6 +578,7 @@ def _process_domain(
                     hist_strong = np.histogram(
                         np.clip(strong_coast / 1000.0, 0.0, COAST_HIST_EDGES_KM[-1] - 1.0e-9), bins=COAST_HIST_EDGES_KM
                     )[0]
+                    min_coast_m = float(site_core_coast[finite_coast].min()) if finite_coast.any() else float("inf")
                     n_near = int(near.sum())
                     n_strong = int(strong_flags.sum())
                     n_strong_near = int((strong_flags & near).sum())
@@ -594,6 +603,7 @@ def _process_domain(
                         accumulator["strong_core_near_count"] += n_strong_near
                         accumulator["offshore_strong_occurrence"] += int(has_offshore_strong)
                         accumulator["coast_hist_all"] += hist_all
+                        accumulator["core_coast_min_m"] = min(accumulator["core_coast_min_m"], min_coast_m)
                         accumulator["coast_hist_strong"] += hist_strong
 
                     day_row = accumulator["day_stats"][day]
@@ -1970,6 +1980,11 @@ def run_aggregate(args: argparse.Namespace) -> int:
         grids[domain_id] = grid
         domain_masks[domain_id] = _build_domain_masks(domain_id, grid, design, study_design_path)
     site_mask = {site_id: mask for masks in domain_masks.values() for site_id, mask in masks.items()}
+    # 有效距離場上限：舊 shard 的距離場飽和於 30 km（最大值恰為該值），新版為 COAST_DISTANCE_CAP_M。
+    coast_cap_km = COAST_DISTANCE_CAP_M / 1000.0
+    for domain_id in present_domains:
+        if np.isclose(float(np.nanmax(np.asarray(grids[domain_id]["coast_distance_m"]))), LEGACY_COAST_CAP_M):
+            coast_cap_km = min(coast_cap_km, LEGACY_COAST_CAP_M / 1000.0)
     for domain_id in present_domains:
         ensure_observation_coast(domain_context[domain_id], grids[domain_id])
 
@@ -2203,6 +2218,10 @@ def run_aggregate(args: argparse.Namespace) -> int:
                 coastal=aggregate_figures.CoastalDiagnosticData(
                     buffer_km=coastal_buffer_km,
                     hist_edges_km=COAST_HIST_EDGES_KM,
+                    cap_km=coast_cap_km,
+                    detection_floor_km=(
+                        float(all_accumulator["core_coast_min_m"]) / 1000.0 if np.isfinite(all_accumulator["core_coast_min_m"]) else None
+                    ),
                     hist_all=all_accumulator["coast_hist_all"],
                     hist_strong=all_accumulator["coast_hist_strong"],
                     hist_long=all_accumulator["coast_hist_long"],
@@ -2302,7 +2321,7 @@ def run_aggregate(args: argparse.Namespace) -> int:
         "coastal_buffer_km": coastal_buffer_km,
         "coast_distance": {
             "definition": "distance from point to nearest cell centre that is not analysis ocean (in-grid only)",
-            "cap_m": COAST_DISTANCE_CAP_M,
+            "cap_m": coast_cap_km * 1000.0,
             "coastal_track_rule": "track mean core coast distance < buffer",
             "computed_from_mask_domains": [d for d in present_domains if grids[d].get("coast_distance_computed")],
             "offshore_strong_threshold": "unchanged (site-wide strong-core quantile threshold)",
