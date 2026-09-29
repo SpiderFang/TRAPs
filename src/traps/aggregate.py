@@ -78,6 +78,10 @@ LIFETIME_EVOLUTION_MIN_HOURS = 12.0
 LIFETIME_EVOLUTION_AGE_POINTS = 21
 """吸引率隨正規化年齡演化曲線的取樣點數（0, 0.05, ..., 1.0）。"""
 FIGURE_KINDS = ("spatial", "hotspots", "seasonal", "lifetime", "timeseries")
+EXAMPLE_FIGURE_KINDS = ("example", "method_comparison")
+"""需重開 OCM snapshot 的圖（``--no-example-figures`` 略過）。"""
+TRACK_FIGURE_KINDS = ("long_tracks", "track_density", "propagation")
+"""只用 track／spatial 產物的圖。"""
 COLOUR_FIELDS = ("curve_pass_frequency", "core_frequency", "mean_core_s1_day", "mean_lifetime_hours")
 """逐站色階上下限的四個逐格欄位。"""
 LIFETIME_THRESHOLD_HOURS = (6.0, 12.0, 24.0)
@@ -389,6 +393,10 @@ def _new_site_accumulator() -> dict[str, Any]:
         "track_lifetimes_all": [],
         "age_sum_sinv": np.zeros(LIFETIME_EVOLUTION_AGE_POINTS, dtype=np.float64),
         "age_track_count": 0,
+        "prop_cx_kmday": [],
+        "prop_cy_kmday": [],
+        "prop_track_n": 0,
+        "born_uncensored": [],
     }
 
 
@@ -401,6 +409,8 @@ def _new_spatial_accumulator(shape: tuple[int, int]) -> dict[str, np.ndarray]:
         "core_s1_sum": np.zeros(shape, dtype=np.float64),
         "lifetime_count": np.zeros(shape, dtype=np.int64),
         "lifetime_sum": np.zeros(shape, dtype=np.float64),
+        "track_count": np.zeros(shape, dtype=np.int64),
+        "long_track_count": np.zeros(shape, dtype=np.int64),
     }
 
 
@@ -579,6 +589,61 @@ def _age_profile_sinv(
     return np.interp(np.linspace(0.0, 1.0, n_points), age, values)
 
 
+M_PER_S_TO_KM_PER_DAY = SECONDS_PER_DAY / 1000.0
+"""公尺／秒換算公里／日（86.4）。"""
+LONG_TRACK_DRAW_LIMIT = 2000
+"""``site_<id>_long_tracks.png`` 最多繪製的 track 數（取壽命最長者）。"""
+
+
+def propagation_velocity_kmday(
+    times_utc_ns: np.ndarray, core_x_m: np.ndarray, core_y_m: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """以中心差分估計 track 核心的傳播速度（km/day），不含首末觀測。
+
+    第 ``i`` 個內部觀測的速度為 ``(p[i+1] - p[i-1]) / (t[i+1] - t[i-1])``，位置為公尺制
+    ``core_x_m``（東向）與 ``core_y_m``（北向），時間差取實際 UTC 差（跨缺口時仍正確）。
+    回傳 ``(內部觀測索引, cx, cy)``；少於 3 個觀測、或前後觀測時間差非正的內部點不回傳。
+    這是模型內 TRAP 核心（結構）的位移速度，不是水體或漂浮物速度。
+    """
+
+    times = np.asarray(times_utc_ns, dtype=np.int64)
+    x = np.asarray(core_x_m, dtype=np.float64)
+    y = np.asarray(core_y_m, dtype=np.float64)
+    if times.size < 3:
+        return np.zeros(0, dtype=np.int64), np.zeros(0), np.zeros(0)
+    dt_seconds = (times[2:] - times[:-2]).astype(np.float64) / 1.0e9
+    ok = dt_seconds > 0.0
+    index = np.arange(1, times.size - 1, dtype=np.int64)[ok]
+    cx = (x[2:] - x[:-2])[ok] / dt_seconds[ok] * M_PER_S_TO_KM_PER_DAY
+    cy = (y[2:] - y[:-2])[ok] / dt_seconds[ok] * M_PER_S_TO_KM_PER_DAY
+    return index, cx, cy
+
+
+def select_representative_track(
+    candidates: Sequence[Mapping[str, Any]], min_lifetime_hours: float | None
+) -> tuple[Mapping[str, Any] | None, str]:
+    """從站內出生的未截尾真實 track 選出代表 track。
+
+    ``candidates`` 每筆含 ``track_id``、``lifetime_hours``、``mean_core_s1_sinv``。若有壽命
+    不小於 ``min_lifetime_hours`` 的候選，只在其中選；否則在全部候選中選。選擇規則：壽命最長，
+    同壽命取平均核心 s1 最強（最負），再同則取較小 ``track_id``（決定性）。回傳
+    ``(選中記錄或 None, 準則)``，準則為 ``ge_threshold``／``longest_available``／``no_candidate``。
+    """
+
+    if not candidates:
+        return None, "no_candidate"
+    pool = list(candidates)
+    criterion = "longest_available"
+    if min_lifetime_hours is not None:
+        restricted = [item for item in pool if float(item["lifetime_hours"]) >= float(min_lifetime_hours)]
+        if restricted:
+            pool, criterion = restricted, "ge_threshold"
+    chosen = min(
+        pool, key=lambda item: (-float(item["lifetime_hours"]), float(item["mean_core_s1_sinv"]), int(item["track_id"]))
+    )
+    return chosen, criterion
+
+
 def _process_track_lifetimes(
     *,
     context: dict[str, Any],
@@ -587,12 +652,18 @@ def _process_track_lifetimes(
     site_accumulators: dict[tuple[str, str], dict[str, Any]],
     spatial_accumulators: dict[str, dict[str, dict[str, np.ndarray]]],
     evolution_min_hours: float = LIFETIME_EVOLUTION_MIN_HOURS,
+    long_track_hours: float | None = None,
 ) -> None:
-    """以 track_observations／tracks.csv 計算各站壽命統計、演化曲線，並累加站內逐格未截尾壽命。
+    """以 track_observations／tracks.csv 計算各站壽命統計、演化曲線、傳播速度，並累加站內逐格分布。
 
     track 依「首個落在該站分析區內的觀測」時間指派 stratum；未截尾 track 在該站分析區內
     每個造訪格點計一次逐格壽命（季節與年份分層，all 由季節相加）。壽命 ≥ ``evolution_min_hours``（預設 12）小時的
     未截尾 track 另累加正規化年齡的核心 s1 剖面（只記入 ``all`` 分層）。
+
+    另累加：(1) 逐格「通過該格的不同 track 數」``track_count``（全部真實 track，含截尾；每 track 每格計一次，
+    Kunz et al. 2024 Fig. 4c）與 ``long_track_count``（未截尾且壽命 ≥ ``long_track_hours``；``None`` 則不計）；
+    (2) 首個觀測在該站分析區內的未截尾 track 記錄 ``born_uncensored``（代表 track 與長壽命路徑圖用）；
+    (3) 至少 3 個觀測的 track，其落在該站分析區內的內部觀測之中心差分傳播速度（僅 ``all`` 分層）。
     """
 
     shape = grid["shape"]
@@ -618,8 +689,10 @@ def _process_track_lifetimes(
         segment_times = times[segment]
         is_uncensored = not (track["left_censored"] or track["right_censored"])
         lifetime_hours = float(track["lifetime_hours"])
+        is_long = bool(is_uncensored and long_track_hours is not None and lifetime_hours >= float(long_track_hours))
         profile: np.ndarray | None = None
         profile_ready = False
+        propagation: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
 
         for site_id, mask_flat in flat_masks.items():
             in_mask = mask_flat[segment_flat]
@@ -628,18 +701,47 @@ def _process_track_lifetimes(
             first_time = int(segment_times[int(np.nonzero(in_mask)[0][0])])
             season = _season_label(first_time)
             year = _year_label(first_time)
+            visited_cells = np.unique(segment_flat[in_mask])
             for stratum in ("all", season, year):
                 accumulator = site_accumulators[(site_id, stratum)]
                 accumulator["track_n"] += 1
                 accumulator["track_lifetimes_all"].append(lifetime_hours)
                 if is_uncensored:
                     accumulator["track_lifetimes"].append(lifetime_hours)
+            for stratum in (season, year):
+                spatial = spatial_accumulators[site_id].setdefault(stratum, _new_spatial_accumulator(shape))
+                spatial["track_count"].reshape(-1)[visited_cells] += 1
+                if is_long:
+                    spatial["long_track_count"].reshape(-1)[visited_cells] += 1
+
+            all_accumulator = site_accumulators[(site_id, "all")]
+            if segment.size >= 3:
+                if propagation is None:
+                    propagation = propagation_velocity_kmday(
+                        segment_times, observations["core_x_m"][segment], observations["core_y_m"][segment]
+                    )
+                interior, cx, cy = propagation
+                keep = in_mask[interior]
+                if np.any(keep):
+                    all_accumulator["prop_cx_kmday"].append(cx[keep])
+                    all_accumulator["prop_cy_kmday"].append(cy[keep])
+                    all_accumulator["prop_track_n"] += 1
 
             if not is_uncensored:
                 continue
-            visited_cells = np.unique(segment_flat[in_mask])
+            if bool(in_mask[0]):
+                all_accumulator["born_uncensored"].append(
+                    {
+                        "track_id": track_id,
+                        "lifetime_hours": lifetime_hours,
+                        "mean_core_s1_sinv": float(np.mean(obs_s1[segment])),
+                        "n_obs": int(segment.size),
+                        "start": int(segment[0]),
+                        "stop": int(segment[-1]) + 1,
+                    }
+                )
             for stratum in (season, year):
-                spatial = spatial_accumulators[site_id].setdefault(stratum, _new_spatial_accumulator(shape))
+                spatial = spatial_accumulators[site_id][stratum]
                 spatial["lifetime_count"].reshape(-1)[visited_cells] += 1
                 spatial["lifetime_sum"].reshape(-1)[visited_cells] += lifetime_hours
 
@@ -648,7 +750,6 @@ def _process_track_lifetimes(
                     profile = _age_profile_sinv(segment_times, obs_s1[segment])
                     profile_ready = True
                 if profile is not None:
-                    all_accumulator = site_accumulators[(site_id, "all")]
                     all_accumulator["age_sum_sinv"] += profile
                     all_accumulator["age_track_count"] += 1
 
@@ -685,6 +786,35 @@ def _track_lifetimes_by_site(
         segment_flat = flat[segment]
         for site_id, mask_flat in flat_masks.items():
             if np.any(mask_flat[segment_flat]):
+                result[site_id].append(float(track["lifetime_hours"]))
+    return result
+
+
+def _born_uncensored_lifetimes_by_site(
+    context: Mapping[str, Any], site_masks_2d: Mapping[str, np.ndarray], grid: Mapping[str, Any]
+) -> dict[str, list[float]]:
+    """各站「首個觀測落在站點分析區內」的未截尾 track 壽命（小時）；長壽命 track 的 null 對照用。
+
+    規則與 :func:`_process_track_lifetimes` 的 ``born_uncensored`` 完全相同（真實與 null 共用同一準則）。
+    """
+
+    nx = grid["shape"][1]
+    observations = context["observations"]
+    tracks_by_id = context["tracks_by_id"]
+    result: dict[str, list[float]] = {site_id: [] for site_id in site_masks_2d}
+    if observations["track_id"].size == 0:
+        return result
+    cols = _nearest_indices(grid["x_m_axis"], observations["core_x_m"])
+    rows = _nearest_indices(grid["y_m_axis"], observations["core_y_m"])
+    flat = rows.astype(np.int64) * np.int64(nx) + cols.astype(np.int64)
+    flat_masks = {site_id: mask.reshape(-1) for site_id, mask in site_masks_2d.items()}
+    for segment in _track_segments(observations):
+        track = tracks_by_id.get(int(observations["track_id"][segment[0]]))
+        if track is None or track["left_censored"] or track["right_censored"]:
+            continue
+        first_flat = int(flat[segment[0]])
+        for site_id, mask_flat in flat_masks.items():
+            if bool(mask_flat[first_flat]):
                 result[site_id].append(float(track["lifetime_hours"]))
     return result
 
@@ -927,6 +1057,37 @@ def _site_hotspots(
     }
 
 
+PROPAGATION_COLUMNS = (
+    "prop_n",
+    "prop_cx_median_kmday",
+    "prop_cy_median_kmday",
+    "prop_speed_median_kmday",
+    "prop_speed_p90_kmday",
+)
+
+
+def _propagation_columns(accumulator: Mapping[str, Any] | None) -> dict[str, Any]:
+    """stratum ``all`` 的核心傳播速度統計（km/day）；其他分層或無樣本時各欄為 ``None``。
+
+    ``prop_n`` 是中心差分速度樣本數（至少 3 個觀測的 track 之站內內部觀測）；其他分層固定 ``None``，
+    ``all`` 但零樣本時 ``prop_n = 0`` 而統計為 ``None``。速率為 ``hypot(cx, cy)``。
+    """
+
+    columns: dict[str, Any] = dict.fromkeys(PROPAGATION_COLUMNS)
+    if accumulator is None:
+        return columns
+    cx = np.concatenate(accumulator["prop_cx_kmday"]) if accumulator["prop_cx_kmday"] else np.zeros(0)
+    cy = np.concatenate(accumulator["prop_cy_kmday"]) if accumulator["prop_cy_kmday"] else np.zeros(0)
+    columns["prop_n"] = int(cx.size)
+    if cx.size:
+        speed = np.hypot(cx, cy)
+        columns["prop_cx_median_kmday"] = float(np.median(cx))
+        columns["prop_cy_median_kmday"] = float(np.median(cy))
+        columns["prop_speed_median_kmday"] = float(np.median(speed))
+        columns["prop_speed_p90_kmday"] = float(np.quantile(speed, 0.9))
+    return columns
+
+
 def _finalize_site_record(
     site_id: str,
     stratum: str,
@@ -998,6 +1159,7 @@ def _finalize_site_record(
         "track_p90_lifetime_hours": _quantile_or_none(lifetimes, 0.9),
         **frac_ge,
     }
+    record.update(_propagation_columns(accumulator if stratum == "all" else None))
     record.update(hotspot_metrics)
     return record
 
@@ -1016,6 +1178,7 @@ SITE_STAT_FIELDNAMES = (
     "track_p90_lifetime_hours", "track_frac_uncensored_ge_6h", "track_frac_uncensored_ge_12h", "track_frac_uncensored_ge_24h",
     "hotspot_quantile", "hotspot_threshold_curve_pass_frequency", "hotspot_cell_count", "hotspot_area_km2",
     "hotspot_mean_curve_pass_frequency", "hotspot_mean_core_s1_day", "hotspot_strong_core_fraction",
+    "prop_n", "prop_cx_median_kmday", "prop_cy_median_kmday", "prop_speed_median_kmday", "prop_speed_p90_kmday",
 )
 
 
@@ -1092,6 +1255,8 @@ def _finalize_spatial(shape: tuple[int, int], accumulator: Mapping[str, np.ndarr
         "mean_core_s1_sinv": mean_core_s1,
         "mean_core_s1_day": mean_core_s1 * SECONDS_PER_DAY,
         "mean_lifetime_hours": mean_lifetime,
+        "track_count": np.asarray(accumulator["track_count"], dtype=np.int64),
+        "long_track_count": np.asarray(accumulator["long_track_count"], dtype=np.int64),
     }
 
 
@@ -1136,9 +1301,12 @@ def _period_label(domain_context: Mapping[str, dict[str, Any]]) -> str:
 
 
 def _figure_relative_paths(site_id: str) -> list[str]:
-    """一個站的五張成果圖相對路徑（``figures/<site_id>/site_<site_id>_<kind>.png``）。"""
+    """一個站的成果圖相對路徑（``figures/<site_id>/site_<site_id>_<kind>.png``）：五張基本圖＋WP-H 的五張。"""
 
-    return [f"figures/{site_id}/site_{site_id}_{kind}.png" for kind in FIGURE_KINDS]
+    return [
+        f"figures/{site_id}/site_{site_id}_{kind}.png"
+        for kind in (*FIGURE_KINDS, *EXAMPLE_FIGURE_KINDS, *TRACK_FIGURE_KINDS)
+    ]
 
 
 def _resolve_figure_font() -> Any:
@@ -1147,6 +1315,149 @@ def _resolve_figure_font() -> Any:
     from .report_font import resolve_cjk_font
 
     return resolve_cjk_font()
+
+
+def _render_site_wp_h_figures(
+    *,
+    output_dir: Path,
+    site_id: str,
+    figure_data: Any,
+    context: Mapping[str, Any],
+    domain_id: str,
+    grid: Mapping[str, Any],
+    born_records: Sequence[Mapping[str, Any]],
+    prop_cx: Sequence[np.ndarray],
+    prop_cy: Sequence[np.ndarray],
+    prop_track_n: int,
+    null_runs: Sequence[Mapping[str, Any]],
+    long_track_hours: float,
+    lifetime_thresholds: Sequence[float],
+    nominal_step_hours: float,
+    example_enabled: bool,
+    surface_root: Path | None,
+    detect_root: Path,
+    font_selection: Any,
+    coastline: Any,
+    state_label: str,
+    param_id: str,
+    period_label: str,
+) -> dict[str, Any]:
+    """一個站的 WP-H 圖：長壽命 track 路徑、track 通過數、傳播速度，以及（可選）代表 TRAP 與方法比較。
+
+    代表 track 只取「首個觀測在站內、未截尾」的真實 track：優先在壽命不小於最大壽命門檻者中選壽命最長者
+    （同壽命取平均核心 s1 最強），沒有達門檻者則取最長者；沒有任何候選時仍輸出空白說明圖，不製造資料。
+    回傳 ``{"paths": 相對路徑清單, "manifest": 該站紀錄}``。
+    """
+
+    from . import example_figures
+
+    observations = context["observations"]
+    long_records = sorted(
+        (item for item in born_records if float(item["lifetime_hours"]) >= long_track_hours),
+        key=lambda item: (-float(item["lifetime_hours"]), int(item["track_id"])),
+    )
+    drawn = long_records[:LONG_TRACK_DRAW_LIMIT]
+    long_tracks = [
+        (
+            float(item["lifetime_hours"]),
+            observations["core_x_m"][item["start"] : item["stop"]],
+            observations["core_y_m"][item["start"] : item["stop"]],
+        )
+        for item in drawn
+    ]
+    null_counts = [
+        float(sum(1 for value in run["born_lifetimes"].get(site_id, []) if value >= long_track_hours)) for run in null_runs
+    ]
+    null_long_mean = float(np.mean(null_counts)) if null_counts else None
+    track_inputs = example_figures.TrackFigureInputs(
+        x_m_axis=grid["x_m_axis"],
+        y_m_axis=grid["y_m_axis"],
+        long_track_hours=long_track_hours,
+        long_tracks=long_tracks,
+        n_long_total=len(long_records),
+        prop_cx_kmday=np.concatenate(prop_cx) if prop_cx else np.zeros(0),
+        prop_cy_kmday=np.concatenate(prop_cy) if prop_cy else np.zeros(0),
+        prop_track_n=prop_track_n,
+        nominal_step_hours=nominal_step_hours,
+        null_long_mean=null_long_mean,
+        null_n_seeds=len(null_counts),
+    )
+    paths = list(
+        example_figures.render_track_figures(
+            output_dir,
+            figure_data,
+            track_inputs,
+            font_selection=font_selection,
+            coastline=coastline,
+            state_label=state_label,
+            param_id=param_id,
+            period_label=period_label,
+        )
+    )
+    record: dict[str, Any] = {
+        "long_track_hours": long_track_hours,
+        "n_long_tracks": len(long_records),
+        "n_long_tracks_drawn": len(drawn),
+        "null_long_track_mean": null_long_mean,
+        "null_n_seeds": len(null_counts),
+        "propagation_n": int(track_inputs.prop_cx_kmday.size),
+        "propagation_n_tracks": prop_track_n,
+        "example": {"enabled": bool(example_enabled)},
+    }
+    if example_enabled:
+        chosen, criterion = select_representative_track(born_records, max(lifetime_thresholds))
+        snapshot = None
+        if chosen is not None:
+            snapshot = example_figures.prepare_example_snapshot(
+                detect_root=detect_root,
+                domain_id=domain_id,
+                shard_manifests=context["shard_manifests"],
+                state_label=state_label,
+                surface_root=surface_root,
+                observations=observations,
+                start=int(chosen["start"]),
+                stop=int(chosen["stop"]),
+                track_id=int(chosen["track_id"]),
+                lifetime_hours=float(chosen["lifetime_hours"]),
+                criterion=criterion,
+            )
+        paths.extend(
+            example_figures.render_snapshot_figures(
+                output_dir,
+                figure_data,
+                snapshot,
+                font_selection=font_selection,
+                coastline=coastline,
+                state_label=state_label,
+                param_id=param_id,
+                period_label=period_label,
+                nominal_step_hours=nominal_step_hours,
+            )
+        )
+        record["example"].update(
+            {
+                "status": "ok" if snapshot is not None else "no_eligible_track",
+                "n_candidates": len(born_records),
+                "selection_min_lifetime_hours": float(max(lifetime_thresholds)),
+                "criterion": criterion,
+            }
+        )
+        if snapshot is not None:
+            record["example"].update(
+                {
+                    "track_id": snapshot.track_id,
+                    "lifetime_hours": snapshot.lifetime_hours,
+                    "n_observations": snapshot.n_observations,
+                    "birth_time_utc_ns": snapshot.time_utc_ns,
+                    "birth_time_utc": example_figures.time_label_utc(snapshot.time_utc_ns),
+                    "month": snapshot.month,
+                    "snapshot_index": snapshot.snapshot_index,
+                    "detection_index": snapshot.detection_index,
+                    "recomputed_core_offset_cells": snapshot.core_offset_cells,
+                    "source_month_dir": snapshot.source_month_dir,
+                }
+            )
+    return {"paths": paths, "manifest": record}
 
 
 # ---------------------------------------------------------------------------
@@ -1174,6 +1485,11 @@ def run_aggregate(args: argparse.Namespace) -> int:
     evolution_raw = getattr(args, "lifetime_evolution_min_hours", None)
     evolution_min_hours = float(LIFETIME_EVOLUTION_MIN_HOURS if evolution_raw is None else evolution_raw)
     _require(evolution_min_hours > 0.0, "--lifetime-evolution-min-hours 必須為正值")
+    long_raw = getattr(args, "long_track_hours", None)
+    long_track_hours = float(max(lifetime_thresholds) if long_raw is None else long_raw)
+    _require(long_track_hours > 0.0, "--long-track-hours 必須為正值")
+    surface_root_raw = getattr(args, "surface_root", None)
+    surface_root = Path(surface_root_raw) if surface_root_raw else None
 
     track_root = Path(args.track_root)
     detect_root = Path(args.detect_root)
@@ -1191,6 +1507,7 @@ def run_aggregate(args: argparse.Namespace) -> int:
     _require(bool(present_domains), "track-root 沒有任何可用的 domain")
 
     figures_enabled = not bool(args.no_figures)
+    example_figures_enabled = figures_enabled and not bool(getattr(args, "no_example_figures", False))
     site_domain = {
         str(site["study_site_id"]): str(site["flow_domain_id"])
         for site in design["study_sites"]
@@ -1252,6 +1569,7 @@ def run_aggregate(args: argparse.Namespace) -> int:
             "observations": loaded["observations"],
             "tracks_by_id": loaded["tracks_by_id"],
             "available_months": available_months,
+            "shard_manifests": shard_manifests,
             "canonical_valid_by_month": canonical_valid_by_month,
             "param_id": manifest.get("param_id") or first_shard["param_id"],
             "detection_config": first_shard["detection_config"],
@@ -1283,6 +1601,7 @@ def run_aggregate(args: argparse.Namespace) -> int:
     for null_root in null_roots:
         seed_value: int | None = None
         per_site_lifetimes: dict[str, list[float]] = {}
+        per_site_born: dict[str, list[float]] = {}
         domain_records: dict[str, dict[str, str]] = {}
         for domain_id in present_domains:
             _require((null_root / domain_id).is_dir(), f"--null-track-root 缺少 domain {domain_id}: {null_root}")
@@ -1294,10 +1613,13 @@ def run_aggregate(args: argparse.Namespace) -> int:
             _require(seed_value is None or seed_value == domain_seed, f"{null_root} 各 domain 的 shuffle seed 不一致")
             seed_value = domain_seed
             per_site_lifetimes.update(_track_lifetimes_by_site(null_loaded, domain_masks[domain_id], grids[domain_id]))
+            per_site_born.update(_born_uncensored_lifetimes_by_site(null_loaded, domain_masks[domain_id], grids[domain_id]))
             manifest_path = null_root / domain_id / "manifest.json"
             domain_records[domain_id] = {"manifest_path": str(manifest_path), "manifest_sha256": _sha256_file(manifest_path)}
         assert seed_value is not None
-        null_runs.append({"root": null_root, "seed": seed_value, "lifetimes": per_site_lifetimes, "domains": domain_records})
+        null_runs.append(
+            {"root": null_root, "seed": seed_value, "lifetimes": per_site_lifetimes, "born_lifetimes": per_site_born, "domains": domain_records}
+        )
     null_seeds = [run["seed"] for run in null_runs]
     _require(len(set(null_seeds)) == len(null_seeds), f"--null-track-root 的 shuffle seed 重複: {null_seeds}")
     track_core_filter = shared["track_core_filter"]
@@ -1328,6 +1650,7 @@ def run_aggregate(args: argparse.Namespace) -> int:
             site_accumulators=site_accumulators,
             spatial_accumulators=spatial_accumulators,
             evolution_min_hours=evolution_min_hours,
+            long_track_hours=long_track_hours,
         )
 
     # --- 站點面積 -------------------------------------------------------------------
@@ -1422,6 +1745,7 @@ def run_aggregate(args: argparse.Namespace) -> int:
 
     # --- 圖面 -------------------------------------------------------------------
     figure_paths: list[str] = []
+    wp_h_manifest: dict[str, Any] = {}
     if figures_enabled:
         from . import aggregate_figures
 
@@ -1476,6 +1800,32 @@ def run_aggregate(args: argparse.Namespace) -> int:
                     period_label=period_label,
                 )
             )
+            site_extra = _render_site_wp_h_figures(
+                output_dir=output_dir,
+                site_id=site_id,
+                figure_data=figure_data,
+                context=domain_context[site_domain[site_id]],
+                domain_id=site_domain[site_id],
+                grid=grid,
+                born_records=all_accumulator["born_uncensored"],
+                prop_cx=all_accumulator["prop_cx_kmday"],
+                prop_cy=all_accumulator["prop_cy_kmday"],
+                prop_track_n=int(all_accumulator["prop_track_n"]),
+                null_runs=null_runs,
+                long_track_hours=long_track_hours,
+                lifetime_thresholds=lifetime_thresholds,
+                nominal_step_hours=domain_step_hours[site_domain[site_id]],
+                example_enabled=example_figures_enabled,
+                surface_root=surface_root,
+                detect_root=detect_root,
+                font_selection=font_selection,
+                coastline=coastline,
+                state_label=shared["state_label"],
+                param_id=shared["param_id"],
+                period_label=period_label,
+            )
+            figure_paths.extend(site_extra["paths"])
+            wp_h_manifest[site_id] = site_extra["manifest"]
 
     # --- manifest ----------------------------------------------------------------
     inputs_record = {
@@ -1510,6 +1860,10 @@ def run_aggregate(args: argparse.Namespace) -> int:
         "hotspot_min_cells_applies_to": "figures_only",
         "lifetime_thresholds_hours": lifetime_thresholds,
         "lifetime_evolution_min_hours": evolution_min_hours,
+        "long_track_hours": long_track_hours,
+        "example_figures_enabled": example_figures_enabled,
+        "surface_root_override": None if surface_root is None else str(surface_root),
+        "site_track_figures": wp_h_manifest,
         "track_core_filter": track_core_filter,
         "lifetime_scope_zh": scope_text,
         "null_inputs": [
@@ -1602,6 +1956,20 @@ def register_subcommands(subparsers: argparse._SubParsersAction) -> None:
         help="時間置換對照組的 track 根目錄（可多個，每個含 <domain>/ 子目錄，由 track-period --shuffle-seed 產生）；"
         "必須與主要 track-root 同 detection／tracking 設定與 track_core_filter（僅 seed 不同），否則拒絕。"
         "site_statistics 加上 null_／excess_／ratio_ 欄位，壽命圖疊上 null CCDF",
+    )
+    aggregate.add_argument(
+        "--long-track-hours", type=float, default=None, metavar="H",
+        help="site_<id>_long_tracks.png 與 track_density 長壽命面板的壽命門檻（小時；名目步長 24 h 時圖面以天顯示），"
+        "預設為 --lifetime-thresholds-hours 的最大值",
+    )
+    aggregate.add_argument(
+        "--no-example-figures", action="store_true",
+        help="略過需重開 OCM snapshot 的兩張圖（site_<id>_example.png、site_<id>_method_comparison.png）；其他圖照常輸出",
+    )
+    aggregate.add_argument(
+        "--surface-root", type=Path, default=None,
+        help="OCM ocm_surface 根目錄（含 <domain_id>/months、<domain_id>/grid）；未指定時重開 OCM 使用 shard manifest 記錄的"
+        "來源路徑，路徑搬移後以此覆寫（仍核對 metadata 與海岸遮罩 SHA-256）",
     )
     aggregate.add_argument("--bootstrap-reps", type=int, default=1_000)
     aggregate.add_argument("--seed", type=int, default=20_260_928)

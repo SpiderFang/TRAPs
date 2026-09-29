@@ -336,6 +336,15 @@ $VENV_PY -m traps aggregate \
 - `manifest.json`：各站強核心門檻（`strong_core_thresholds`）、各站色階、`font`
   （字型家族、檔名、SHA-256）。
 
+**WP-H 追加的逐站圖**（`figures/<site_id>/`，預設輸出）：`site_<id>_example.png`（代表 TRAP 與後續演化）、
+`_method_comparison.png`（s1／流線／散度三分圖）、`_long_tracks.png`、`_track_density.png`、`_propagation.png`。
+前兩張需**重開 OCM 月份並重算代表 track 起始時刻的單一 snapshot**：來源路徑與海岸遮罩取自 shard
+`manifest.json` 的 `source.month_dir`／`source.coastline_mask.path`（核對 SHA-256，重算核心與已存核心相差須 ≤ 1 格，
+否則失敗）。OCM 搬移後以 `--surface-root <ocm_surface 根目錄>`（含 `<domain>/months`、`<domain>/grid`）覆寫；
+不想重開 OCM 時加 `--no-example-figures`。`--long-track-hours H`（預設＝最大壽命門檻）決定長壽命 track 圖的門檻。
+額外旗標經 `TRAPS_AGGREGATE_ARGS` 傳入，腳本不需修改。`site_statistics.csv` 新增 `prop_n`、`prop_cx_median_kmday`、
+`prop_cy_median_kmday`、`prop_speed_median_kmday`、`prop_speed_p90_kmday`（僅 stratum `all`）。
+
 圖面文字為繁體中文，需要系統有 Noto Sans CJK TC（本伺服器
 `/usr/share/fonts/opentype/noto/NotoSansCJK-*.ttc`）或候選清單中的其他字型；
 `aggregate` 會先以 FreeType charmap 檢查字元涵蓋，找不到合格字型即在寫檔前以

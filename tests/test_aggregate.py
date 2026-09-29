@@ -801,7 +801,8 @@ def test_process_track_lifetimes_per_site_strata_censoring_and_evolution() -> No
     assert spatial_accumulators["site_a"]["DJF"]["lifetime_count"][1, 1] == 1
     assert spatial_accumulators["site_a"]["DJF"]["lifetime_sum"][1, 1] == pytest.approx(13.0)
     assert spatial_accumulators["site_a"]["DJF"]["lifetime_count"][0, 0] == 0
-    assert "JJA" not in spatial_accumulators["site_a"]
+    assert spatial_accumulators["site_a"]["JJA"]["lifetime_count"].sum() == 0  # 截尾 track 不計壽命，但計 track_count
+    assert spatial_accumulators["site_a"]["JJA"]["track_count"][1, 1] == 1
     assert spatial_accumulators["site_b"]["DJF"]["lifetime_count"][0, 0] == 1
 
 

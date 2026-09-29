@@ -234,6 +234,22 @@ km²）、`site_<id>_seasonal.png`（DJF/MAM/JJA/SON 曲線通過頻率小圖，
 各圖色階上下限是該站自己分析區的 2–98 百分位（記錄於 manifest `colour_limits`），
 海岸線疊圖與色條對齊沿用既有 `coastline.py`／`colorbar_layout.py`。
 
+**WP-H 逐站追加圖與統計**（預設輸出，皆逐站獨立、色階取自該站）：
+
+* `site_<id>_example.png`（Kunz 2024 Fig. 2 風格）：代表 track ＝該站「首個觀測在站內、未截尾」的真實 track 中壽命最長者
+  （同壽命取平均核心 s1 最強；優先限定壽命 ≥ `--lifetime-thresholds-hours` 最大值，無則取最長）。於其起始時刻經 shard manifest
+  的來源 provenance 重開 OCM 月份與海岸遮罩（核對 SHA-256；可用 `--surface-root` 覆寫搬移後的路徑），以該 shard 的
+  `detection_config` 重算該 snapshot，重算核心與已存核心須相差 ≤ 1 格，否則明確失敗。圖含 s1（day⁻¹）、抽稀速度箭頭、全部合格曲線（淡）、
+  代表曲線與核心（紅粗線）、核心路徑，以及約 1/3、2/3 壽命與最後觀測的曲線（較淺色，標「+6 h」或「+3 天」）。站內無候選 track 時輸出標示原因的空白圖。
+* `site_<id>_method_comparison.png`（Serra 2020 Fig. 4d 風格）：同一 snapshot 的 (a) s1＋TRAP、(b) 流線（streamplot）＋TRAP、(c) 水平散度（day⁻¹）＋TRAP；
+  註腳註明流線不是粒子軌跡、散度不同於 TRAP 吸引。
+* `site_<id>_long_tracks.png`（Kunz Fig. 4b）：未截尾、站內出生、壽命 ≥ `--long-track-hours`（預設＝最大壽命門檻）的核心路徑，依壽命著色；超過 2000 條只畫最長者並註明；
+  給 `--null-track-root` 時註腳附 null 各 seed 平均條數。
+* `site_<id>_track_density.png`（Kunz Fig. 4c）：通過各格的不同 track 數（全部真實 track／長壽命 track；每 track 每格計一次）；同時寫入 spatial npz 的 `track_count`、`long_track_count`。
+* `site_<id>_propagation.png`（Kunz Fig. 5c 類比）：≥3 觀測 track 的核心中心差分傳播速度（東向 cx、北向 cy，km/day，不含首末觀測）直方圖與 16 扇區去向玫瑰圖。
+  `site_statistics` 新增 `prop_n`、`prop_cx_median_kmday`、`prop_cy_median_kmday`、`prop_speed_median_kmday`、`prop_speed_p90_kmday`（僅 stratum `all`）。
+* 旗標：`--no-example-figures`（略過需重開 OCM 的前兩張）、`--surface-root`、`--long-track-hours`。manifest 的 `site_track_figures` 記錄各站代表 track、重算核心偏移與實際來源目錄。
+
 圖面文字為繁體中文，字型由 `report_font.resolve_cjk_font()` 依固定順序
 （Noto Sans CJK TC、Noto Sans TC、Source Han Sans TC、PingFang TC、Heiti TC、
 Arial Unicode MS）解析，並以 FreeType charmap 檢查涵蓋圖面所有固定文字與五站名稱；

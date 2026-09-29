@@ -359,7 +359,7 @@ def test_lifetime_figure_overlays_null_ccdf(runs: dict[str, Path], tmp_path: Pat
     out = tmp_path / "agg"
     args = _namespace(
         runs["strong"], runs["detect"], out, bootstrap_reps=20,
-        null_track_root=[runs["null1"], runs["null2"]],
+        null_track_root=[runs["null1"], runs["null2"]], no_example_figures=True,
     )
     assert agg.run_aggregate(args) == 0
     assert (out / "figures" / "gongliao" / "site_gongliao_lifetime.png").stat().st_size > 0
