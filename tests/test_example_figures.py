@@ -197,7 +197,7 @@ def test_aggregate_end_to_end_wp_h(built_run, tmp_path: Path, fake_font) -> None
     out = tmp_path / "agg"
     moved = tmp_path / "moved_surface"
     shutil.copytree(root / "ocm_surface", moved)
-    ns = _namespace(track_root, detect_root, out, long_track_hours=1.0, surface_root=moved, no_example_figures=False)
+    ns = _namespace(track_root, detect_root, out, long_track_hours=1.0, surface_root=moved, no_example_figures=False, prop_min_obs=3)
     assert agg.run_aggregate(ns) == 0
     for site in ("nanwan", "gongliao", "guishan"):
         for kind in ("example", "method_comparison", "long_tracks", "track_density", "propagation"):

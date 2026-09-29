@@ -470,7 +470,7 @@ def test_end_to_end_coastal_and_offshore_classification(coastal_run, tmp_path: P
     for buffer_km in (2.0, 1.5):
         out = tmp_path / f"agg_{buffer_km}"
         namespace = _namespace(
-            track_root, detect_root, out, no_figures=True, coastal_buffer_km=buffer_km, long_track_hours=1.0,
+            track_root, detect_root, out, no_figures=True, prop_min_obs=3, coastal_buffer_km=buffer_km, long_track_hours=1.0,
             null_track_root=[null_root], lifetime_thresholds_hours=[1.0, 2.0],
         )
         assert agg.run_aggregate(namespace) == 0
@@ -564,7 +564,7 @@ def test_cli_registers_coastal_and_prop_flags() -> None:
     args = parser.parse_args(["aggregate", "--track-root", "a", "--detect-root", "b", "--output-dir", "c", "--coastal-buffer-km", "5", "--prop-min-obs", "6"])
     assert args.coastal_buffer_km == 5.0 and args.prop_min_obs == 6
     defaults = parser.parse_args(["aggregate", "--track-root", "a", "--detect-root", "b", "--output-dir", "c"])
-    assert defaults.coastal_buffer_km == 10.0 and defaults.prop_min_obs == 3
+    assert defaults.coastal_buffer_km == 10.0 and defaults.prop_min_obs is None
 
 
 def test_coast_hist_edges_cover_full_cap_with_overflow_bin_and_no_spike() -> None:
@@ -578,3 +578,45 @@ def test_coast_hist_edges_cover_full_cap_with_overflow_bin_and_no_spike() -> Non
     values = np.clip(np.array([1.0, 12.0, 45.0, 90.0, 150.0]), 0.0, edges[-1] - 1.0e-9)
     counts = np.histogram(values, bins=edges)[0]
     assert counts[-1] == 0 and counts[15] == 0 and counts.sum() == 5  # 30 km 處沒有堆積
+
+
+def test_coastal_panel_a_has_no_free_text_and_floor_is_legend_entry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import matplotlib.figure
+    import matplotlib.text
+
+    seen: dict[str, object] = {}
+    original = matplotlib.figure.Figure.savefig
+
+    def _spy(self, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        if str(args[0]).endswith("d.png"):
+            seen["fig"] = self
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(matplotlib.figure.Figure, "savefig", _spy)
+    data = _coastal_data()
+    aggregate_figures.render_coastal_diagnostic(tmp_path / "d.png", data, footer="f", dpi=50)
+    fig = seen["fig"]
+    ax = fig.axes[0]
+    assert ax.get_xlabel() == FIGURE_TEXT["coast_dist_xlabel"] if "coast_dist_xlabel" in FIGURE_TEXT else True
+    legend = ax.get_legend()
+    assert legend is not None
+    legend_texts = [t.get_text() for t in legend.get_texts()]
+    assert any(t.startswith("檢出下限 ≈ 2.6 km") and "此範圍無法定位核心" in t for t in legend_texts)
+    allowed = {id(ax.title), id(ax.xaxis.label), id(ax.yaxis.label), id(ax.xaxis.offsetText), id(ax.yaxis.offsetText)}
+    allowed |= {id(t) for t in legend.findobj(matplotlib.text.Text)}
+    fig.canvas.draw()
+    for axis in (ax.xaxis, ax.yaxis):
+        allowed |= {id(t) for t in axis.findobj(matplotlib.text.Text)}
+    extra = [t.get_text() for t in ax.findobj(matplotlib.text.Text) if id(t) not in allowed and t.get_text().strip()]
+    assert all(t.startswith("≥") for t in extra), extra  # 僅允許溢位 bin 的座標標記，不得有檢出下限等自由文字
+    assert not any("檢出下限" in t for t in extra)
+
+
+def test_prop_min_obs_auto_depends_on_step() -> None:
+    assert agg.auto_prop_min_obs(1.0) == 7
+    assert agg.auto_prop_min_obs(3.0) == 4
+    assert agg.auto_prop_min_obs(24.0) == 3
+    assert agg.resolve_prop_min_obs(None, 1.0) == 7
+    assert agg.resolve_prop_min_obs(None, 24.0) == 3
+    assert agg.resolve_prop_min_obs(5, 1.0) == 5
+    assert agg.resolve_prop_min_obs(2, 1.0) == 3

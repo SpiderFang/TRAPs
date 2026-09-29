@@ -188,7 +188,7 @@ FIGURE_TEXT: Final[Mapping[str, str]] = MappingProxyType(
         "coast_type_note": "近岸型：track 平均核心距岸小於緩衝帶；近岸外：不小於緩衝帶",
         "coast_cap_label": "≥",
         "coast_floor_a": "檢出下限 ≈",
-        "coast_floor_b": "：此範圍內無法定位核心",
+        "coast_floor_b": "（此範圍無法定位核心）",
         "coast_footnote": "近岸帶以 core 平均距岸判定；近岸型與近岸外皆與隨機對照比較",
         "coast_no_tracks": "無未截尾 track",
         "coastal_locked_legend": "近岸型 track（虛線）",
@@ -213,6 +213,8 @@ FIGURE_TEXT: Final[Mapping[str, str]] = MappingProxyType(
         "propagation_fit_note": "每條 track 以核心位置 x(t)、y(t) 最小平方線性擬合（至少 3 個觀測）；直方圖與玫瑰圖只含移動 track，只描述模型內 TRAP 核心的位移，不等於水體或漂浮物速度。",
         "propagation_resid": "殘差 RMS 中位數",
         "propagation_stationary_frac": "靜止比例",
+        "propagation_min_obs_a": "擬合至少",
+        "propagation_min_obs_b": "個觀測",
         "propagation_fitted": "已擬合 track",
         "unit_m": "m",
     }

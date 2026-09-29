@@ -150,6 +150,8 @@ class TrackFigureInputs:
     """與 ``prop_cx_kmday`` 平行；True 為靜止 track（擬合位移小於 1 格）。``None`` 表示全部視為移動。"""
     prop_resid_rms_m: np.ndarray | None = None
     """每條已擬合 track 的位置殘差 RMS（m）。"""
+    prop_min_obs: int | None = None
+    """實際使用的最少擬合觀測數（顯示於副標題）。"""
 
 
 # ---------------------------------------------------------------------------
@@ -1071,6 +1073,7 @@ def render_propagation(
         f"{T['propagation_moving']} {n}／{T['propagation_stationary']} {n_stationary}"
         + (f"（{T['propagation_stationary_frac']} {100.0 * stationary_fraction:.0f}%）" if n_fitted else "")
         + f"｜{T['propagation_stationary_def']}"
+        + (f"｜{T['propagation_min_obs_a']} {int(tracks.prop_min_obs)} {T['propagation_min_obs_b']}" if tracks.prop_min_obs else "")
     )
     resid_text = ""
     if tracks.prop_resid_rms_m is not None and np.size(tracks.prop_resid_rms_m):

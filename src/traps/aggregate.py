@@ -100,7 +100,26 @@ COASTAL_BUFFER_KM = 10.0
 核心的偵測需要完整有效的導數模板與局部極小鄰域，實際上不可能落在距非海域格點約 2.5–3 km 以內（檢出下限），
 故 3 km 緩衝帶只剔除核心本來就不存在的區域；強核心與長壽命 track 集中在 3–10 km，預設取 10 km 才真正檢驗近岸影響。"""
 PROP_MIN_OBS = 3
-"""``--prop-min-obs`` 的預設值與下限：傳播速度線性擬合所需的最少觀測數。"""
+"""``--prop-min-obs`` 的下限（及日資料的預設值）：傳播速度線性擬合所需的最少觀測數。"""
+PROP_MIN_WINDOW_HOURS = 6.0
+"""次日步長資料自動最少觀測數所要求的擬合時間窗（小時）。"""
+
+
+def auto_prop_min_obs(nominal_step_hours: float) -> int:
+    """``--prop-min-obs`` 未指定時的有效值：步長 < 24 h 為 ``max(3, ceil(6 h / step)) + 1``（逐時 7），日資料為 3。"""
+
+    import math
+
+    step = float(nominal_step_hours)
+    if step >= 24.0:
+        return PROP_MIN_OBS
+    return max(PROP_MIN_OBS, math.ceil(PROP_MIN_WINDOW_HOURS / step - 1e-9)) + 1
+
+
+def resolve_prop_min_obs(raw: int | None, nominal_step_hours: float) -> int:
+    """明確指定值（不低於 3）優先；``None`` 則依名目步長自動決定。"""
+
+    return auto_prop_min_obs(nominal_step_hours) if raw is None else max(PROP_MIN_OBS, int(raw))
 COAST_HIST_STEP_KM = 2.0
 LEGACY_COAST_CAP_M = 30_000.0
 """舊 shard（v1／早期 v2）距離場的飽和上限。"""
@@ -1649,6 +1668,7 @@ def _render_site_wp_h_figures(
     long_track_hours: float,
     lifetime_thresholds: Sequence[float],
     nominal_step_hours: float,
+    prop_min_obs: int = PROP_MIN_OBS,
     example_enabled: bool,
     surface_root: Path | None,
     detect_root: Path,
@@ -1717,6 +1737,7 @@ def _render_site_wp_h_figures(
         null_long_offshore_mean=float(np.mean(null_offshore_counts)) if (has_coast and null_offshore_counts) else None,
         prop_stationary=fitted[:, 4] != 0.0,
         prop_resid_rms_m=fitted[:, 2],
+        prop_min_obs=int(prop_min_obs),
     )
     paths = list(
         example_figures.render_track_figures(
@@ -1874,7 +1895,6 @@ def run_aggregate(args: argparse.Namespace) -> int:
     coast_buffer_m = coastal_buffer_km * 1000.0
     _require(coast_buffer_m < COAST_DISTANCE_CAP_M, f"--coastal-buffer-km 必須小於近岸距離場飽和上限 {COAST_DISTANCE_CAP_M / 1000.0:g} km")
     prop_min_obs_raw = getattr(args, "prop_min_obs", None)
-    prop_min_obs = max(PROP_MIN_OBS, int(PROP_MIN_OBS if prop_min_obs_raw is None else prop_min_obs_raw))
 
     track_root = Path(args.track_root)
     detect_root = Path(args.detect_root)
@@ -1973,6 +1993,7 @@ def run_aggregate(args: argparse.Namespace) -> int:
         len({round(v, 9) for v in domain_step_hours.values()}) == 1,
         f"各 domain 的名目時間步長不一致: {domain_step_hours}",
     )
+    prop_min_obs = resolve_prop_min_obs(prop_min_obs_raw, next(iter(domain_step_hours.values())))
 
     for domain_id in present_domains:
         first_month = sorted(domain_context[domain_id]["available_months"])[0]
@@ -2271,6 +2292,7 @@ def run_aggregate(args: argparse.Namespace) -> int:
                 long_track_hours=long_track_hours,
                 lifetime_thresholds=lifetime_thresholds,
                 nominal_step_hours=domain_step_hours[site_domain[site_id]],
+                prop_min_obs=prop_min_obs,
                 example_enabled=example_figures_enabled,
                 surface_root=surface_root,
                 detect_root=detect_root,
@@ -2329,6 +2351,7 @@ def run_aggregate(args: argparse.Namespace) -> int:
         "propagation": {
             "method": "per-track least-squares linear fit of refined core x(t), y(t)",
             "min_observations": prop_min_obs,
+            "min_observations_source": "explicit" if prop_min_obs_raw is not None else "auto (max(3, ceil(6 h / step)) + 1 for step < 24 h; 3 for daily)",
             "stationary_rule": "fitted displacement over track duration < 1 grid cell",
             "stationary_cell_m": {d: grid_cell_size_m(grids[d]) for d in present_domains},
         },
@@ -2455,8 +2478,9 @@ def register_subcommands(subparsers: argparse._SubParsersAction) -> None:
         "統計、近岸型／近岸外 track 分類與各地圖上的虛線緩衝帶",
     )
     aggregate.add_argument(
-        "--prop-min-obs", type=int, default=PROP_MIN_OBS, metavar="N",
-        help="傳播速度線性擬合所需的最少觀測數（預設且下限為 3）",
+        "--prop-min-obs", type=int, default=None, metavar="N",
+        help="傳播速度線性擬合所需的最少觀測數（下限 3）；未指定時依步長自動：步長 < 24 h 為 max(3, ceil(6 h / 步長)) + 1"
+        "（逐時 7），日資料 3",
     )
     aggregate.add_argument("--bootstrap-reps", type=int, default=1_000)
     aggregate.add_argument("--seed", type=int, default=20_260_928)

@@ -783,11 +783,9 @@ def render_coastal_diagnostic(output_path: Path, data: SiteFigureData, *, footer
     x_max = min(max(x_max, 1.0), cap_km + float(edges[cap_index + 1] - edges[cap_index]))
     floor_km = diag.detection_floor_km
     if floor_km is not None and any_hist and floor_km > 0.0:
-        left.axvspan(0.0, float(floor_km), color="#9e9e9e", alpha=0.25, linewidth=0, zorder=0)
-        left.annotate(
-            f"{T['coast_floor_a']} {float(floor_km):.1f} km{T['coast_floor_b']}",
-            xy=(float(floor_km), 0.97), xycoords=("data", "axes fraction"), xytext=(4, -2), textcoords="offset points",
-            ha="left", va="top", fontsize=7.5, color="#424242", wrap=True,
+        left.axvspan(
+            0.0, float(floor_km), color="#9e9e9e", alpha=0.25, linewidth=0, zorder=0,
+            label=f"{T['coast_floor_a']} {float(floor_km):.1f} km{T['coast_floor_b']}",
         )
     if overflow_drawn:
         left.text(cap_km + 0.5 * float(edges[cap_index + 1] - edges[cap_index]), 0.0, cap_label, rotation=90, ha="center", va="bottom", fontsize=7.5, color="#424242")
