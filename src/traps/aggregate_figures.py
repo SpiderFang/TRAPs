@@ -73,6 +73,8 @@ class SiteFigureData:
     """吸引強度演化面板納入的未截尾軌跡最短壽命（小時）。"""
     null_lifetimes: Sequence[Sequence[float]] = ()
     """時間置換對照組：每個 seed 一組該站未截尾壽命（小時）；空序列表示沒有對照組。"""
+    nominal_step_hours: float = 1.0
+    """名目時間步長（小時）；24 或門檻皆為 24 的倍數時，壽命 CCDF 以「天」顯示。"""
     lifetime_scope_text: str = ""
     """壽命統計對象說明（例如「強核心結構（各站前 10%）」）；空字串表示不註明。"""
 
@@ -214,6 +216,12 @@ def _view_extent(data: SiteFigureData, margin_cells: int = 2) -> tuple[slice, sl
 FOOTER_LINE_INCH = 0.135
 """註腳每行（7 pt）預留的高度（英吋）。"""
 FOOTER_BASE_INCH = 0.14
+
+
+def matplotlib_ticker_null() -> Any:
+    from matplotlib.ticker import NullLocator
+
+    return NullLocator()
 
 
 def _hours_label(hours: float) -> str:
@@ -526,20 +534,33 @@ def render_lifetime(output_path: Path, data: SiteFigureData, *, footer: str, dpi
     """壽命 CCDF（未截尾實線、含截尾虛線），以及吸引強度隨正規化年齡的演化（Kunz et al. 2024 Fig. 5b 風格）。"""
 
     _, plt = _load_matplotlib()
-    fig_w, fig_h = 13.0, 5.6
+    n_table = sum(1 for t in data.lifetime_thresholds_hours if float(t) > 0)
+    table_inch = 0.19 * n_table + 0.1 if n_table else 0.0
+    fig_w, fig_h = 13.0, 5.6 + table_inch
     figure, (left, right) = plt.subplots(1, 2, figsize=(fig_w, fig_h))
     figure.subplots_adjust(
-        left=0.07, right=0.97, bottom=(_footer_height_inch(footer) + 0.75) / fig_h, top=1.0 - 1.05 / fig_h, wspace=0.25
+        left=0.07, right=0.97, bottom=(_footer_height_inch(footer) + 0.75 + table_inch) / fig_h, top=1.0 - 1.05 / fig_h, wspace=0.25
     )
 
-    x_u, y_u = _ccdf(data.lifetimes_uncensored)
-    x_a, y_a = _ccdf(data.lifetimes_all)
+    thresholds = [float(t) for t in data.lifetime_thresholds_hours if float(t) > 0]
+    daily = float(data.nominal_step_hours) >= 24.0 or (bool(thresholds) and all(abs(t / 24.0 - round(t / 24.0)) < 1e-9 for t in thresholds))
+    unit_h = 24.0 if daily else 1.0
+    unit_name = T["day_unit"] if daily else "h"
+
+    def _positive(values: Sequence[float]) -> list[float]:
+        return [float(v) for v in values if float(v) > 0]
+
+    x_u, y_u = _ccdf(_positive(data.lifetimes_uncensored))
+    x_a, y_a = _ccdf(_positive(data.lifetimes_all))
+    x_u, x_a = x_u / unit_h, x_a / unit_h
+    null_sets = [_positive(values) for values in data.null_lifetimes]
+    grid, null_mean, null_low, null_high = null_ccdf_band(null_sets, x_u * unit_h)
+    grid = grid / unit_h
+    has_null = grid.size > 0
     if x_u.size:
         left.step(x_u, y_u, where="post", color="#1b4965", linestyle="-", label=f"{T['uncensored']} (n={x_u.size})")
     if x_a.size:
         left.step(x_a, y_a, where="post", color="#1b4965", linestyle="--", alpha=0.7, label=f"{T['all_tracks']} (n={x_a.size})")
-    grid, null_mean, null_low, null_high = null_ccdf_band(data.null_lifetimes, x_u)
-    has_null = grid.size > 0
     if has_null:
         n_seeds = sum(1 for values in data.null_lifetimes if len(values))
         positive = null_high[null_high > 0]
@@ -552,24 +573,53 @@ def render_lifetime(output_path: Path, data: SiteFigureData, *, footer: str, dpi
             grid, np.where(null_mean > 0, null_mean, np.nan), where="post", color="#6c757d", linestyle="--", linewidth=1.6,
             label=f"{T['null_ccdf_legend']}（{n_seeds} seeds）",
         )
+    table_lines: list[str] = []
     if x_u.size or x_a.size or has_null:
         left.set_yscale("log")
-        left.legend(fontsize=8)
+        left.legend(fontsize=8, loc="upper right")
     else:
         left.text(0.5, 0.5, T["no_data"], ha="center", va="center", transform=left.transAxes)
     if x_u.size or x_a.size:
         all_record = data.records.get("all") or {}
-        for threshold in data.lifetime_thresholds_hours:
-            label = f"{_hours_label(threshold)} h"
-            excess = all_record.get(f"excess_track_frac_uncensored_ge_{_hours_label(threshold)}h") if has_null else None
-            if excess is not None:
-                label += f"  {T['excess']} {float(excess):+.2f}"
-            left.axvline(float(threshold), color="#6c757d", linestyle=":", linewidth=1.0, zorder=1)
-            left.text(
-                float(threshold), 0.98, label, transform=left.get_xaxis_transform(), rotation=90, ha="right",
-                va="top", fontsize=7, color="#495057",
-            )
-    left.set_xlabel(T["lifetime_hours"])
+        lifetimes_u = np.asarray(_positive(data.lifetimes_uncensored), dtype=np.float64)
+        for threshold in thresholds:
+            key = _hours_label(threshold)
+            left.axvline(threshold / unit_h, color="#6c757d", linestyle=":", linewidth=1.0, zorder=1)
+            actual = all_record.get(f"track_frac_uncensored_ge_{key}h")
+            if actual is None and lifetimes_u.size:
+                actual = float(np.mean(lifetimes_u >= threshold))
+            null_frac = all_record.get(f"null_track_frac_uncensored_ge_{key}h") if has_null else None
+            if null_frac is None and has_null:
+                fracs = [float(np.mean(np.asarray(v) >= threshold)) for v in null_sets if len(v)]
+                null_frac = float(np.mean(fracs)) if fracs else None
+            excess = all_record.get(f"excess_track_frac_uncensored_ge_{key}h") if has_null else None
+            if excess is None and actual is not None and null_frac is not None:
+                excess = float(actual) - float(null_frac)
+            sep = T["table_sep"]
+            line = f"≥{_hours_label(threshold / unit_h)} {unit_name}"
+            if actual is not None:
+                line += f"：{T['actual_short']} {float(actual):.2f}"
+                if null_frac is not None and excess is not None:
+                    line += f"{sep}{T['random_short']} {float(null_frac):.2f}{sep}{T['excess']} {float(excess):+.2f}"
+            table_lines.append(line)
+        # 對數 x 軸：以門檻與常用時間刻度為刻度，避免小門檻在線性軸上擠在一起。
+        lo_candidates = [v for v in (x_u[:1].tolist() + x_a[:1].tolist() + [t / unit_h for t in thresholds]) if v > 0]
+        hi_candidates = [v for v in (x_u[-1:].tolist() + x_a[-1:].tolist() + [t / unit_h for t in thresholds]) if v > 0]
+        lo, hi = min(lo_candidates), max(hi_candidates)
+        if hi <= lo:
+            hi = lo * 2.0
+        left.set_xscale("log")
+        left.set_xlim(lo / 1.25, hi * 1.25)
+        base = (1, 2, 3, 5, 7, 10, 14, 20, 30, 50, 70, 100, 150, 200, 300, 500, 700, 1000) if daily else (1, 2, 3, 6, 12, 24, 48, 72, 168, 336, 720, 1440, 2160, 4320)
+        ticks = [t / unit_h for t in thresholds]
+        for cand in base:
+            if lo / 1.25 <= cand <= hi * 1.25 and all(abs(np.log(cand / t)) > np.log(1.8) for t in ticks):
+                ticks.append(float(cand))
+        ticks = sorted(set(ticks))
+        left.set_xticks(ticks)
+        left.set_xticklabels([_hours_label(t) for t in ticks])
+        left.xaxis.set_minor_locator(matplotlib_ticker_null())
+    left.set_xlabel(T["lifetime_days"] if daily else T["lifetime_hours"])
     left.set_ylabel(T["ccdf_ylabel"])
     left.set_title(
         f"{T['ccdf_title']}\n{T['lifetime_refers_to']}：{data.lifetime_scope_text}" if data.lifetime_scope_text else T["ccdf_title"],
@@ -594,6 +644,12 @@ def render_lifetime(output_path: Path, data: SiteFigureData, *, footer: str, dpi
     right.grid(alpha=0.25)
 
     figure.suptitle(f"{data.site_name_zh} — {T['lifetime_title']}", fontsize=13, y=1.0 - 0.12 / fig_h, va="top")
+    if table_lines:
+        # 門檻數據表：置於左面板 x 軸標籤下方（figure 座標，預留專用高度），不與曲線、圖例或刻度重疊。
+        figure.text(
+            0.07, (_footer_height_inch(footer) + 0.1) / fig_h, "\n".join(table_lines), ha="left", va="bottom", fontsize=8,
+            color="#343a40", linespacing=1.45,
+        )
     _place_footer(figure, footer)
     _save(figure, plt, output_path, dpi)
     return output_path

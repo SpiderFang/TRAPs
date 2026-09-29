@@ -1089,3 +1089,67 @@ def test_map_figures_have_tight_layout_and_aligned_colorbars(tmp_path: Path, mon
     for _axis, _pos, tight in captured["axes"]:  # type: ignore[misc]
         for box in footer_boxes:  # type: ignore[attr-defined]
             assert box.y1 <= tight.y0 + 1.0
+
+
+def _text_overlaps_in_lifetime_figure(tmp_path: Path, **overrides) -> tuple[list[tuple[str, str]], Path]:
+    import dataclasses
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.figure
+    import matplotlib.text
+
+    captured: list[matplotlib.figure.Figure] = []
+    original_save = aggregate_figures._save
+
+    def _spy(figure, plt, output_path, dpi):
+        captured.append(figure)
+        figure.canvas.draw()
+        renderer = figure.canvas.get_renderer()
+        right_ids = {id(a) for a in figure.axes[1].findobj(matplotlib.text.Text)}
+        texts = [
+            artist for artist in figure.findobj(matplotlib.text.Text)
+            if id(artist) not in right_ids and artist.get_visible() and artist.get_text().strip() and artist.get_window_extent(renderer).width > 0
+        ]
+        boxes = [(artist.get_text(), artist.get_window_extent(renderer)) for artist in texts]
+        captured.append(boxes)
+        original_save(figure, plt, output_path, dpi)
+
+    aggregate_figures._save = _spy
+    try:
+        data = dataclasses.replace(_synthetic_figure_data(), **overrides)
+        out = aggregate_figures.render_lifetime(tmp_path / "lifetime.png", data, footer="footer", dpi=60)
+    finally:
+        aggregate_figures._save = original_save
+    boxes = captured[1]
+    overlaps = [
+        (a, b) for i, (a, box_a) in enumerate(boxes) for b, box_b in boxes[i + 1 :] if box_a.overlaps(box_b)
+    ]
+    return overlaps, out
+
+
+@pytest.mark.filterwarnings("ignore")
+def test_lifetime_figure_hourly_thresholds_do_not_overlap(tmp_path: Path) -> None:
+    rng = np.random.default_rng(3)
+    lifetimes = [float(v) for v in np.round(rng.pareto(1.3, 300) * 3 + 1)] + [300.0, 280.0]
+    null = [[float(v) for v in np.round(rng.pareto(1.8, 300) * 2 + 1)] for _ in range(4)]
+    overlaps, out = _text_overlaps_in_lifetime_figure(
+        tmp_path, lifetime_thresholds_hours=(3.0, 6.0, 12.0, 24.0), lifetimes_uncensored=lifetimes,
+        lifetimes_all=lifetimes + [300.0], null_lifetimes=null,
+    )
+    assert overlaps == []
+    assert out.stat().st_size > 1_000
+
+
+@pytest.mark.filterwarnings("ignore")
+def test_lifetime_figure_daily_unit_shows_days_without_overlap(tmp_path: Path) -> None:
+    lifetimes = [24.0 * v for v in (1, 1, 2, 2, 3, 4, 7, 10, 30, 120)]
+    null = [[24.0 * v for v in (1, 1, 1, 2, 3, 5)] for _ in range(3)]
+    overlaps, _ = _text_overlaps_in_lifetime_figure(
+        tmp_path, lifetime_thresholds_hours=(48.0, 72.0, 168.0), lifetimes_uncensored=lifetimes,
+        lifetimes_all=lifetimes, null_lifetimes=null, nominal_step_hours=24.0,
+    )
+    assert overlaps == []
+    for key in ("day_unit", "lifetime_days", "actual_short", "random_short", "table_sep"):
+        assert set(report_font.FIGURE_TEXT[key]) <= REQUIRED_FIGURE_GLYPHS

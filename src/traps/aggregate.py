@@ -1225,6 +1225,7 @@ def run_aggregate(args: argparse.Namespace) -> int:
 
     # --- 讀入並驗證每個 domain 的 track/shard manifest --------------------------------
     domain_context: dict[str, dict[str, Any]] = {}
+    domain_step_hours: dict[str, float] = {}
     for domain_id in present_domains:
         loaded = _load_track_domain(track_root, domain_id)
         manifest = loaded["manifest"]
@@ -1237,6 +1238,13 @@ def run_aggregate(args: argparse.Namespace) -> int:
             _require(shard_manifest["detection_config"] == first_shard["detection_config"], f"{domain_id}/{month} detection_config 與同區其他月份不一致")
             _require(shard_manifest["min_coverage"] == first_shard["min_coverage"], f"{domain_id}/{month} min_coverage 與同區其他月份不一致")
 
+        step_config = manifest.get("tracking_config") or {}
+        step_hours = (
+            float(step_config["nominal_time_step_seconds"]) / 3600.0
+            if step_config.get("nominal_time_step_seconds") is not None
+            else float(manifest.get("nominal_time_step_hours") or 1.0)
+        )
+        domain_step_hours[domain_id] = step_hours
         canonical_valid_by_month = _canonical_valid_snapshot_indices_by_month(loaded["canonical"])
         domain_context[domain_id] = {
             "manifest": manifest,
@@ -1258,6 +1266,11 @@ def run_aggregate(args: argparse.Namespace) -> int:
     # --- 網格與站點分析區 ---------------------------------------------------------
     grids: dict[str, dict[str, Any]] = {}
     domain_masks: dict[str, dict[str, np.ndarray]] = {}
+    _require(
+        len({round(v, 9) for v in domain_step_hours.values()}) == 1,
+        f"各 domain 的名目時間步長不一致: {domain_step_hours}",
+    )
+
     for domain_id in present_domains:
         first_month = sorted(domain_context[domain_id]["available_months"])[0]
         grid = _load_domain_grid(detect_root, domain_id, first_month)
@@ -1445,6 +1458,7 @@ def run_aggregate(args: argparse.Namespace) -> int:
                 null_lifetimes=[list(run["lifetimes"].get(site_id, [])) for run in null_runs],
                 lifetime_scope_text=scope_text,
                 lifetime_thresholds_hours=lifetime_thresholds,
+                nominal_step_hours=domain_step_hours[site_domain[site_id]],
                 evolution_mean_day=evolution_mean_day,
                 evolution_track_count=age_count,
                 day_stats={day: list(row) for day, row in all_accumulator["day_stats"].items()},
