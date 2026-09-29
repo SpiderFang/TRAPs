@@ -72,6 +72,9 @@ FIGURE_KINDS = ("spatial", "hotspots", "seasonal", "lifetime", "timeseries")
 COLOUR_FIELDS = ("curve_pass_frequency", "core_frequency", "mean_core_s1_day", "mean_lifetime_hours")
 """逐站色階上下限的四個逐格欄位。"""
 LIFETIME_THRESHOLD_HOURS = (6.0, 12.0, 24.0)
+"""``--lifetime-thresholds-hours`` 的預設值；驅動 ``track_frac_uncensored_ge_<N>h`` 欄位。"""
+HOTSPOT_MIN_CELLS = 3
+"""``--hotspot-min-cells`` 的預設值：圖面熱點連通塊最少格數（只影響圖面，不影響統計）。"""
 SECONDS_PER_DAY = 86_400.0
 
 _KNOWN_TOP_LEVEL_NAMES = ("site_statistics.csv", "site_statistics.json", "manifest.json", "manifest.sha256", "_SUCCESS")
@@ -563,11 +566,12 @@ def _process_track_lifetimes(
     grid: Mapping[str, Any],
     site_accumulators: dict[tuple[str, str], dict[str, Any]],
     spatial_accumulators: dict[str, dict[str, dict[str, np.ndarray]]],
+    evolution_min_hours: float = LIFETIME_EVOLUTION_MIN_HOURS,
 ) -> None:
     """以 track_observations／tracks.csv 計算各站壽命統計、演化曲線，並累加站內逐格未截尾壽命。
 
     track 依「首個落在該站分析區內的觀測」時間指派 stratum；未截尾 track 在該站分析區內
-    每個造訪格點計一次逐格壽命（季節與年份分層，all 由季節相加）。壽命 ≥ 12 小時的
+    每個造訪格點計一次逐格壽命（季節與年份分層，all 由季節相加）。壽命 ≥ ``evolution_min_hours``（預設 12）小時的
     未截尾 track 另累加正規化年齡的核心 s1 剖面（只記入 ``all`` 分層）。
     """
 
@@ -619,7 +623,7 @@ def _process_track_lifetimes(
                 spatial["lifetime_count"].reshape(-1)[visited_cells] += 1
                 spatial["lifetime_sum"].reshape(-1)[visited_cells] += lifetime_hours
 
-            if lifetime_hours >= LIFETIME_EVOLUTION_MIN_HOURS:
+            if lifetime_hours >= evolution_min_hours:
                 if not profile_ready:
                     profile = _age_profile_sinv(segment_times, obs_s1[segment])
                     profile_ready = True
@@ -686,12 +690,58 @@ def _top_quantile_mask(field: np.ndarray, site_mask: np.ndarray, quantile: float
     return inside & (field >= threshold) & (field > 0.0), threshold
 
 
+def threshold_label(hours: float) -> str:
+    """壽命門檻的欄位標籤：整數小時寫成 ``24``，非整數寫成 ``1.5``。"""
+
+    value = float(hours)
+    return f"{int(round(value))}" if value == int(value) else f"{value:g}"
+
+
+def lifetime_fraction_column(hours: float) -> str:
+    """壽命門檻對應的 site_statistics 欄位名 ``track_frac_uncensored_ge_<N>h``。"""
+
+    return f"track_frac_uncensored_ge_{threshold_label(hours)}h"
+
+
+def remove_small_components(mask: np.ndarray, min_cells: int) -> np.ndarray:
+    """移除 4-連通格數小於 ``min_cells`` 的連通塊（純 numpy／Python 疊代，不用 scipy）。
+
+    以疊代式 flood fill 標記連通塊；``min_cells <= 1`` 時原樣回傳（複製）。輸入遮罩
+    不會被修改。此濾除只供圖面使用，統計欄位與 npz 的原始遮罩保持未濾除定義。
+    """
+
+    array = np.asarray(mask, dtype=bool)
+    if min_cells <= 1 or not array.any():
+        return array.copy()
+    n_rows, n_cols = array.shape
+    remaining = array.copy()
+    kept = np.zeros_like(array)
+    for start_row, start_col in zip(*np.nonzero(array), strict=True):
+        if not remaining[start_row, start_col]:
+            continue
+        remaining[start_row, start_col] = False
+        stack = [(int(start_row), int(start_col))]
+        members: list[tuple[int, int]] = []
+        while stack:
+            row, col = stack.pop()
+            members.append((row, col))
+            for next_row, next_col in ((row - 1, col), (row + 1, col), (row, col - 1), (row, col + 1)):
+                if 0 <= next_row < n_rows and 0 <= next_col < n_cols and remaining[next_row, next_col]:
+                    remaining[next_row, next_col] = False
+                    stack.append((next_row, next_col))
+        if len(members) >= min_cells:
+            rows_idx, cols_idx = zip(*members, strict=True)
+            kept[list(rows_idx), list(cols_idx)] = True
+    return kept
+
+
 def _site_hotspots(
     accumulator: Mapping[str, np.ndarray],
     finalized: Mapping[str, np.ndarray],
     site_mask: np.ndarray,
     cell_area_m2: np.ndarray,
     hotspot_quantile: float,
+    min_cells: int = HOTSPOT_MIN_CELLS,
 ) -> dict[str, Any]:
     """計算一個站×分層的熱點遮罩與指標。
 
@@ -699,6 +749,9 @@ def _site_hotspots(
     的格點；另以同一分位數取 ``core_frequency`` 熱點遮罩（供圖面輪廓）。指標：門檻、格數、
     面積（km²）、熱點內平均曲線通過頻率、熱點內核心的平均 s1（day⁻¹，依核心數加權）、
     以及該站強核心落在熱點格點的比例。
+
+    統計與 ``curve_mask``／``core_mask`` 保持未濾除定義；另回傳 ``curve_mask_filtered``／
+    ``core_mask_filtered``（移除 4-連通格數 < ``min_cells`` 的小塊），只供圖面與 npz 附加陣列。
     """
 
     curve_mask, curve_threshold = _top_quantile_mask(finalized["curve_pass_frequency"], site_mask, hotspot_quantile)
@@ -717,6 +770,8 @@ def _site_hotspots(
     return {
         "curve_mask": curve_mask,
         "core_mask": core_mask,
+        "curve_mask_filtered": remove_small_components(curve_mask, min_cells),
+        "core_mask_filtered": remove_small_components(core_mask, min_cells),
         "core_threshold": core_threshold,
         "metrics": {
             "hotspot_quantile": float(hotspot_quantile),
@@ -741,6 +796,7 @@ def _finalize_site_record(
     hotspot_metrics: Mapping[str, Any],
     bootstrap_reps: int,
     rng: np.random.Generator,
+    lifetime_thresholds_hours: Sequence[float] = LIFETIME_THRESHOLD_HOURS,
 ) -> dict[str, Any]:
     """把一組 site×stratum 累加器轉成 site_statistics 記錄（``scope`` 固定為 site_area）。"""
 
@@ -756,10 +812,12 @@ def _finalize_site_record(
     }
     mean_pass_fraction = float(accumulator["pass_fraction_sum"] / n_valid) if n_valid else None
 
-    frac_ge = {}
-    for threshold in LIFETIME_THRESHOLD_HOURS:
+    frac_ge: dict[str, float | None] = {}
+    for threshold in lifetime_thresholds_hours:
         n_uncensored = len(lifetimes)
-        frac_ge[threshold] = float(sum(1 for value in lifetimes if value >= threshold) / n_uncensored) if n_uncensored else None
+        frac_ge[lifetime_fraction_column(threshold)] = (
+            float(sum(1 for value in lifetimes if value >= threshold) / n_uncensored) if n_uncensored else None
+        )
 
     record = {
         "site_id": site_id,
@@ -796,9 +854,7 @@ def _finalize_site_record(
         "track_mean_lifetime_hours": float(np.mean(lifetimes)) if lifetimes else None,
         "track_median_lifetime_hours": _quantile_or_none(lifetimes, 0.5),
         "track_p90_lifetime_hours": _quantile_or_none(lifetimes, 0.9),
-        "track_frac_uncensored_ge_6h": frac_ge[6.0],
-        "track_frac_uncensored_ge_12h": frac_ge[12.0],
-        "track_frac_uncensored_ge_24h": frac_ge[24.0],
+        **frac_ge,
     }
     record.update(hotspot_metrics)
     return record
@@ -821,15 +877,27 @@ SITE_STAT_FIELDNAMES = (
 )
 
 
-def _write_site_statistics(output_dir: Path, records: list[dict[str, Any]]) -> None:
+def site_stat_fieldnames(lifetime_thresholds_hours: Sequence[float] = LIFETIME_THRESHOLD_HOURS) -> list[str]:
+    """依壽命門檻設定產生 CSV 欄位；預設門檻等同 :data:`SITE_STAT_FIELDNAMES`。"""
+
+    default_columns = [lifetime_fraction_column(hours) for hours in LIFETIME_THRESHOLD_HOURS]
+    anchor = SITE_STAT_FIELDNAMES.index(default_columns[0])
+    columns = [lifetime_fraction_column(hours) for hours in lifetime_thresholds_hours]
+    return [*SITE_STAT_FIELDNAMES[:anchor], *columns, *SITE_STAT_FIELDNAMES[anchor + len(default_columns) :]]
+
+
+def _write_site_statistics(
+    output_dir: Path, records: list[dict[str, Any]], lifetime_thresholds_hours: Sequence[float] = LIFETIME_THRESHOLD_HOURS
+) -> None:
     """寫出 long-format ``site_statistics.csv`` 與 ``site_statistics.json``。"""
 
     csv_path = output_dir / "site_statistics.csv"
     with csv_path.open("w", encoding="utf-8", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=list(SITE_STAT_FIELDNAMES))
+        fieldnames = site_stat_fieldnames(lifetime_thresholds_hours)
+        writer = csv.DictWriter(stream, fieldnames=fieldnames)
         writer.writeheader()
         for record in records:
-            writer.writerow({key: record.get(key) for key in SITE_STAT_FIELDNAMES})
+            writer.writerow({key: record.get(key) for key in fieldnames})
     _atomic_write_json(output_dir / "site_statistics.json", {"schema_version": AGGREGATE_SCHEMA_VERSION, "records": records})
 
 
@@ -929,6 +997,15 @@ def run_aggregate(args: argparse.Namespace) -> int:
     hotspot_quantile = float(args.hotspot_quantile)
     _require(0.0 < strong_quantile < 1.0, "--strong-quantile 必須介於 0 與 1 之間（不含端點）")
     _require(0.0 < hotspot_quantile < 1.0, "--hotspot-quantile 必須介於 0 與 1 之間（不含端點）")
+    hotspot_min_cells = int(getattr(args, "hotspot_min_cells", HOTSPOT_MIN_CELLS))
+    _require(hotspot_min_cells >= 1, "--hotspot-min-cells 必須 >= 1")
+    raw_thresholds = getattr(args, "lifetime_thresholds_hours", None)
+    lifetime_thresholds = [float(v) for v in (raw_thresholds if raw_thresholds else LIFETIME_THRESHOLD_HOURS)]
+    _require(all(v > 0.0 for v in lifetime_thresholds), "--lifetime-thresholds-hours 必須全為正值")
+    _require(len({lifetime_fraction_column(v) for v in lifetime_thresholds}) == len(lifetime_thresholds), "--lifetime-thresholds-hours 不可重複")
+    evolution_raw = getattr(args, "lifetime_evolution_min_hours", None)
+    evolution_min_hours = float(LIFETIME_EVOLUTION_MIN_HOURS if evolution_raw is None else evolution_raw)
+    _require(evolution_min_hours > 0.0, "--lifetime-evolution-min-hours 必須為正值")
 
     track_root = Path(args.track_root)
     detect_root = Path(args.detect_root)
@@ -1038,6 +1115,7 @@ def run_aggregate(args: argparse.Namespace) -> int:
             grid=grids[domain_id],
             site_accumulators=site_accumulators,
             spatial_accumulators=spatial_accumulators,
+            evolution_min_hours=evolution_min_hours,
         )
 
     # --- 站點面積 -------------------------------------------------------------------
@@ -1077,7 +1155,7 @@ def run_aggregate(args: argparse.Namespace) -> int:
         for stratum in sorted(set(ordered) | {"all", *SEASONS}):
             accumulator = spatial_by_stratum.get(stratum) or _new_spatial_accumulator(shape)
             finalized = _finalize_spatial(shape, accumulator)
-            hotspot = _site_hotspots(accumulator, finalized, mask, cell_area_m2, hotspot_quantile)
+            hotspot = _site_hotspots(accumulator, finalized, mask, cell_area_m2, hotspot_quantile, hotspot_min_cells)
             site_spatial[site_id][stratum] = _mask_to_site(finalized, mask)
             site_hotspots[site_id][stratum] = hotspot
             hotspot_metrics_by_stratum[stratum] = hotspot["metrics"]
@@ -1095,9 +1173,10 @@ def run_aggregate(args: argparse.Namespace) -> int:
                     hotspot_metrics=hotspot_metrics_by_stratum[stratum],
                     bootstrap_reps=int(args.bootstrap_reps),
                     rng=rng,
+                    lifetime_thresholds_hours=lifetime_thresholds,
                 )
             )
-    _write_site_statistics(output_dir, records)
+    _write_site_statistics(output_dir, records, lifetime_thresholds)
 
     # --- 逐站 spatial npz ------------------------------------------------------------
     for site_id in sites_present:
@@ -1112,6 +1191,8 @@ def run_aggregate(args: argparse.Namespace) -> int:
                 site_mask=site_mask[site_id],
                 hotspot_curve_mask=hotspot["curve_mask"],
                 hotspot_core_mask=hotspot["core_mask"],
+                hotspot_curve_mask_filtered=hotspot["curve_mask_filtered"],
+                hotspot_core_mask_filtered=hotspot["core_mask_filtered"],
                 strong_core_threshold_sinv=np.float64(np.nan if threshold is None else threshold),
                 hotspot_threshold_curve_pass_frequency=np.float64(
                     np.nan if hotspot["metrics"]["hotspot_threshold_curve_pass_frequency"] is None else hotspot["metrics"]["hotspot_threshold_curve_pass_frequency"]
@@ -1147,6 +1228,10 @@ def run_aggregate(args: argparse.Namespace) -> int:
                 hotspot_curve_mask=site_hotspots[site_id]["all"]["curve_mask"],
                 hotspot_core_mask=site_hotspots[site_id]["all"]["core_mask"],
                 hotspot_metrics=site_hotspots[site_id]["all"]["metrics"],
+                hotspot_curve_mask_filtered=site_hotspots[site_id]["all"]["curve_mask_filtered"],
+                hotspot_core_mask_filtered=site_hotspots[site_id]["all"]["core_mask_filtered"],
+                hotspot_min_cells=hotspot_min_cells,
+                lifetime_evolution_min_hours=evolution_min_hours,
                 colour_limits=colour_limits[site_id],
                 records={stratum: record_index[(site_id, stratum)] for stratum in ("all", *SEASONS) if (site_id, stratum) in record_index},
                 lifetimes_uncensored=list(all_accumulator["track_lifetimes"]),
@@ -1198,6 +1283,10 @@ def run_aggregate(args: argparse.Namespace) -> int:
         "scope": SITE_SCOPE,
         "strong_quantile": strong_quantile,
         "hotspot_quantile": hotspot_quantile,
+        "hotspot_min_cells": hotspot_min_cells,
+        "hotspot_min_cells_applies_to": "figures_only",
+        "lifetime_thresholds_hours": lifetime_thresholds,
+        "lifetime_evolution_min_hours": evolution_min_hours,
         "strong_core_thresholds": {
             site_id: {
                 "strong_core_threshold_sinv": site_thresholds[site_id]["threshold_sinv"],
@@ -1261,6 +1350,18 @@ def register_subcommands(subparsers: argparse._SubParsersAction) -> None:
     )
     aggregate.add_argument(
         "--hotspot-quantile", type=float, default=0.90, help="各站 curve_pass_frequency 的熱點分位數，預設最高 10%% 格點"
+    )
+    aggregate.add_argument(
+        "--hotspot-min-cells", type=int, default=HOTSPOT_MIN_CELLS,
+        help="成果圖熱點（曲線與核心）移除 4-連通格數小於此值的小塊；只影響圖面，統計與 npz 原始遮罩不變，預設 3",
+    )
+    aggregate.add_argument(
+        "--lifetime-thresholds-hours", type=float, nargs="+", default=list(LIFETIME_THRESHOLD_HOURS), metavar="H",
+        help="壽命門檻（小時，可多個），驅動 track_frac_uncensored_ge_<N>h 欄位，預設 6 12 24",
+    )
+    aggregate.add_argument(
+        "--lifetime-evolution-min-hours", type=float, default=LIFETIME_EVOLUTION_MIN_HOURS,
+        help="吸引強度演化圖只納入壽命不小於此小時數的未截尾軌跡，預設 12",
     )
     aggregate.add_argument("--bootstrap-reps", type=int, default=1_000)
     aggregate.add_argument("--seed", type=int, default=20_260_928)

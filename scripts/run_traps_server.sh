@@ -4,7 +4,10 @@
 # 用法：
 #   scripts/run_traps_server.sh <MODE>
 # MODE 為下列其中之一（大小寫需相符）：
-#   SETUP | PREPARE | STAGE | MASKS | DETECT | TRACK | AGGREGATE | STATUS
+#   SETUP | PREPARE | STAGE | MASKS | DAILY | DETECT | TRACK | AGGREGATE | STATUS
+#
+# TRAPS_FIELD=hourly（預設）使用逐時 ocm_surface；TRAPS_FIELD=daily25h 使用 DAILY 模式建立的
+# 去潮汐 25 h 日平均產品（ocm_surface_daily25h），DETECT/TRACK 會自動切換來源與 24 h 追蹤參數。
 #
 # 完整說明見 docs/operations/SERVER_RUNBOOK.md。本檔案只做部署/執行編排，實際的
 # TRAP 檢出與追蹤演算法在 `python -m traps` CLI（src/traps/cli.py）。
@@ -29,9 +32,20 @@ set -euo pipefail
 : "${TRAPS_JOBS:=24}"
 : "${TRAPS_PARAM_ID:=r0_default}"
 : "${TRAPS_DETECT_ARGS:=}"
+: "${TRAPS_AGGREGATE_ARGS:=}"
+: "${TRAPS_FIELD:=hourly}"
+: "${TRAPS_TRACK_CORE_M:=10000}"
+: "${TRAPS_TRACK_CURVE_M:=20000}"
 : "${TRAPS_EXPECTED_GIT_COMMIT:=}"
 : "${TRAPS_MIN_FREE_GB:=50}"
 : "${TRAPS_UV_SOURCE:=/data/LBT/cache/formal/ded8463/first-v2-h30-fixed-calendar-m10-435a57a/uv-bin/uv}"
+
+case "${TRAPS_FIELD}" in
+  hourly) TRAPS_SURFACE_ROOT_FIELD="${TRAPS_LOCAL_DATA}/ocm_surface" ;;
+  daily25h) TRAPS_SURFACE_ROOT_FIELD="${TRAPS_LOCAL_DATA}/ocm_surface_daily25h" ;;
+  *) printf 'FATAL: TRAPS_FIELD 只能是 hourly 或 daily25h，目前為 %q\n' "${TRAPS_FIELD}" >&2; exit 1 ;;
+esac
+TRAPS_DAILY_ROOT="${TRAPS_LOCAL_DATA}/ocm_surface_daily25h"
 
 TRAPS_UV_BIN="${TRAPS_RUNS}/bin/uv"
 TRAPS_VENV_PY="${TRAPS_REPO}/.venv/bin/python"
@@ -55,7 +69,8 @@ die() {
 usage() {
   cat >&2 <<'EOF'
 用法: run_traps_server.sh <MODE>
-MODE: SETUP | PREPARE | STAGE | MASKS | DETECT | TRACK | AGGREGATE | STATUS
+MODE: SETUP | PREPARE | STAGE | MASKS | DAILY | DETECT | TRACK | AGGREGATE | STATUS
+環境變數 TRAPS_FIELD=hourly|daily25h（預設 hourly）
 詳見 docs/operations/SERVER_RUNBOOK.md
 EOF
 }
@@ -236,6 +251,29 @@ PYEOF
     fi
   done
 
+  if [[ "${TRAPS_FIELD}" == "daily25h" ]]; then
+    local daily_months_str daily_expected daily_ok
+    daily_months_str="$(python3 -c "
+import sys
+sys.path.insert(0, '${SCRIPT_DIR}')
+from stage_ocm_surface_local import _parse_months
+print(' '.join(_parse_months('${TRAPS_MONTHS}')))
+" 2>/dev/null || true)"
+    for domain in "${DOMAIN_ARRAY[@]}"; do
+      check_name="domain ${domain} 日平均產品（daily25h）每月皆有 _SUCCESS 且 grid 存在"
+      daily_ok=1
+      [[ -f "${TRAPS_DAILY_ROOT}/${domain}/grid/metadata.json" ]] || daily_ok=0
+      for daily_expected in ${daily_months_str}; do
+        [[ -f "${TRAPS_DAILY_ROOT}/${domain}/months/${daily_expected}/_SUCCESS" ]] || daily_ok=0
+      done
+      if [[ "${daily_ok}" -eq 1 && -n "${daily_months_str}" ]]; then
+        check_pass "${check_name}"
+      else
+        check_fail "${check_name}" "請先執行 DAILY（${TRAPS_DAILY_ROOT}/${domain}）"
+      fi
+    done
+  fi
+
   check_name="沒有其他 run_traps_server.sh 執行程序持有鎖"
   # 能執行到這裡代表 with_lock 已成功取得鎖（否則已 die），視為通過。
   check_pass "${check_name}"
@@ -314,6 +352,49 @@ mode_masks() {
 }
 
 # ---------------------------------------------------------------------------
+# DAILY（逐時 -> 25 h 去潮汐日平均產品；各 domain 平行）
+# ---------------------------------------------------------------------------
+
+mode_daily() {
+  with_lock
+  [[ -x "${TRAPS_VENV_PY}" ]] || die "找不到 ${TRAPS_VENV_PY}；請先執行 SETUP"
+
+  local log_dir="${TRAPS_RUNS}/logs/daily"
+  mkdir -p "${log_dir}" "${TRAPS_DAILY_ROOT}" "${TRAPS_RUNS}/cache/mpl" "${TRAPS_RUNS}/cache/xdg"
+
+  local domain
+  for domain in "${DOMAIN_ARRAY[@]}"; do
+    [[ -f "${TRAPS_LOCAL_DATA}/.staged/${domain}.done" ]] || die "domain ${domain} 尚未完成本機 staging（先執行 STAGE）"
+  done
+
+  log "DAILY: ${#DOMAIN_ARRAY[@]} domain 平行建立 25 h 日平均 -> ${TRAPS_DAILY_ROOT}"
+  local pids=() failed=0
+  for domain in "${DOMAIN_ARRAY[@]}"; do
+    (
+      MPLCONFIGDIR="${TRAPS_RUNS}/cache/mpl" XDG_CACHE_HOME="${TRAPS_RUNS}/cache/xdg" \
+        OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+        "${TRAPS_VENV_PY}" -m traps build-daily-fields \
+        --surface-root "${TRAPS_LOCAL_DATA}/ocm_surface" \
+        --domain-id "${domain}" \
+        --output-root "${TRAPS_DAILY_ROOT}" \
+        --months "${TRAPS_MONTHS}" \
+        --window-hours 25 --min-hours 23 --sample-hour-utc 12 \
+        --resume \
+        >"${log_dir}/${domain}.log" 2>&1
+    ) &
+    pids+=("$!")
+  done
+  local pid
+  for pid in "${pids[@]}"; do
+    wait "${pid}" || failed=1
+  done
+  if [[ "${failed}" -ne 0 ]]; then
+    die "DAILY 有 domain 失敗，詳見 ${log_dir}/"
+  fi
+  log "DAILY: 完成（之後以 TRAPS_FIELD=daily25h 執行 DETECT/TRACK/AGGREGATE，建議使用獨立的 TRAPS_PARAM_ID）"
+}
+
+# ---------------------------------------------------------------------------
 # DETECT
 # ---------------------------------------------------------------------------
 
@@ -366,7 +447,7 @@ print(' '.join(_parse_months('${TRAPS_MONTHS}')))
     if MPLCONFIGDIR="${TRAPS_RUNS}/cache/mpl" XDG_CACHE_HOME="${TRAPS_RUNS}/cache/xdg" \
       OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
       "${TRAPS_VENV_PY}" -m traps detect-shards \
-      --surface-root "${TRAPS_LOCAL_DATA}/ocm_surface" \
+      --surface-root "${TRAPS_SURFACE_ROOT_FIELD}" \
       --domain-id "${domain}" \
       --month "${month}" \
       --ocean-mask "${TRAPS_INPUTS}/ocean_masks/${domain}/analysis_ocean_mask_coastline_corrected_v2.npy" \
@@ -385,9 +466,10 @@ print(' '.join(_parse_months('${TRAPS_MONTHS}')))
     fi
   }
   export -f detect_one_job
-  export TRAPS_VENV_PY TRAPS_LOCAL_DATA TRAPS_INPUTS TRAPS_PARAM_ID TRAPS_DETECT_ARGS TRAPS_RUNS
+  export TRAPS_VENV_PY TRAPS_LOCAL_DATA TRAPS_INPUTS TRAPS_PARAM_ID TRAPS_DETECT_ARGS TRAPS_RUNS TRAPS_SURFACE_ROOT_FIELD
   export detect_root log_dir summary_file
 
+  log "DETECT: field=${TRAPS_FIELD}（surface root ${TRAPS_SURFACE_ROOT_FIELD}）"
   log "DETECT: ${#DOMAIN_ARRAY[@]} domain x ${#months[@]} 月份，平行度 ${TRAPS_JOBS}"
   local xargs_status=0
   if command -v parallel >/dev/null 2>&1; then
@@ -423,6 +505,17 @@ mode_track() {
   local log_dir="${run_dir}/logs/track"
   mkdir -p "${track_root}" "${log_dir}"
 
+  # daily25h：24 h 名目步長、36 h 最大時間缺口；hourly 維持 track-period 預設值。
+  local track_extra_args=()
+  if [[ "${TRAPS_FIELD}" == "daily25h" ]]; then
+    track_extra_args=(
+      --nominal-time-step-hours 24
+      --tracking-max-time-gap-hours 36
+      --tracking-max-core-distance-m "${TRAPS_TRACK_CORE_M}"
+      --tracking-max-curve-distance-m "${TRAPS_TRACK_CURVE_M}"
+    )
+  fi
+
   track_one_domain() {
     local domain="$1"
     local job_log="${log_dir}/${domain}.log"
@@ -433,6 +526,7 @@ mode_track() {
       --output-dir "${track_root}/${domain}" \
       --param-id "${TRAPS_PARAM_ID}" \
       --resume \
+      "${track_extra_args[@]+"${track_extra_args[@]}"}" \
       >"${job_log}" 2>&1
   }
   export -f track_one_domain
@@ -485,7 +579,8 @@ mode_aggregate() {
     --detect-root "${run_dir}/detect" \
     --output-dir "${aggregate_dir}" \
     --param-id "${TRAPS_PARAM_ID}" \
-    --resume
+    --resume \
+    ${TRAPS_AGGREGATE_ARGS}
   log "AGGREGATE: 完成"
 }
 
@@ -566,6 +661,7 @@ main() {
     PREPARE) mode_prepare ;;
     STAGE) mode_stage ;;
     MASKS) mode_masks ;;
+    DAILY) mode_daily ;;
     DETECT) mode_detect ;;
     TRACK) mode_track ;;
     AGGREGATE) mode_aggregate ;;

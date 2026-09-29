@@ -3,7 +3,7 @@
 每個站輸出到 ``figures/<site_id>/``：
 
 - ``site_<site_id>_spatial.png``：站點分析區內的 2×2 空間圖；
-- ``site_<site_id>_hotspots.png``：曲線通過頻率前段格點（熱點）與核心頻率熱點輪廓；
+- ``site_<site_id>_hotspots.png``：曲線通過頻率前段格點（熱點）與核心頻率熱點格點；
 - ``site_<site_id>_seasonal.png``：四季曲線通過頻率小圖與季節強核心出現率／平均通過格點比例；
 - ``site_<site_id>_lifetime.png``：壽命 CCDF 與吸引強度隨正規化年齡演化；
 - ``site_<site_id>_timeseries.png``：逐日強核心出現比例與平均通過格點比例（30 日滑動平均）。
@@ -61,6 +61,16 @@ class SiteFigureData:
     day_stats: Mapping[str, Sequence[float]]
     anchor_lonlat: tuple[float, float]
     n_valid_snapshots: int
+    hotspot_curve_mask_filtered: np.ndarray | None = None
+    """濾除小連通塊後的曲線熱點遮罩（只供繪圖）；``None`` 表示不濾除。"""
+    hotspot_core_mask_filtered: np.ndarray | None = None
+    """濾除小連通塊後的核心熱點遮罩（只供繪圖）；``None`` 表示不濾除。"""
+    hotspot_min_cells: int = 1
+    """圖面熱點連通塊最小格數，僅用於註腳文字。"""
+    lifetime_thresholds_hours: Sequence[float] = (6.0, 12.0, 24.0)
+    """壽命 CCDF 圖上標示的門檻（小時）。"""
+    lifetime_evolution_min_hours: float = 12.0
+    """吸引強度演化面板納入的未截尾軌跡最短壽命（小時）。"""
 
 
 def _load_matplotlib() -> tuple[Any, Any]:
@@ -179,21 +189,87 @@ def _view_extent(data: SiteFigureData, margin_cells: int = 2) -> tuple[slice, sl
     return slice(r0, r1), slice(c0, c1)
 
 
-def _prepare_map_axis(
-    axis: Any, data: SiteFigureData, view: tuple[slice, slice], coastline: CoastlineGeometry | None, *, max_ticks: int | None = None
-) -> None:
-    """設定經緯度軸標籤、等比例、海岸線疊圖與站點錨點（只有標記，沒有半徑圓）。"""
+FOOTER_LINE_INCH = 0.135
+"""註腳每行（7 pt）預留的高度（英吋）。"""
+FOOTER_BASE_INCH = 0.14
+
+
+def _hours_label(hours: float) -> str:
+    """把小時數寫成不帶多餘小數的文字（``12`` 或 ``1.5``）。"""
+
+    return f"{float(hours):g}"
+
+
+def _footer_height_inch(footer: str) -> float:
+    return FOOTER_BASE_INCH + FOOTER_LINE_INCH * (footer.count("\n") + 1)
+
+
+def _place_footer(figure: Any, footer: str) -> None:
+    """把註腳貼在 figure 最底端（以英吋定位），配合下邊界預留高度，不會壓到座標軸或 xlabel。"""
+
+    figure.text(0.5, FOOTER_BASE_INCH / 2.0 / figure.get_figheight(), footer, ha="center", va="bottom", fontsize=7)
+
+
+def _view_limits(data: SiteFigureData, view: tuple[slice, slice]) -> tuple[tuple[float, float], tuple[float, float]]:
+    """地圖視窗的 (xlim, ylim)：格點中心外擴半格，使 pcolormesh 格緣剛好貼齊座標框。"""
 
     rows, cols = view
     lon = data.lon[cols]
     lat = data.lat[rows]
     half_lon = float(np.median(np.diff(lon))) / 2.0 if lon.size > 1 else 0.01
     half_lat = float(np.median(np.diff(lat))) / 2.0 if lat.size > 1 else 0.01
-    axis.set_xlim(float(lon.min()) - half_lon, float(lon.max()) + half_lon)
-    axis.set_ylim(float(lat.min()) - half_lat, float(lat.max()) + half_lat)
+    return (
+        (float(lon.min()) - half_lon, float(lon.max()) + half_lon),
+        (float(lat.min()) - half_lat, float(lat.max()) + half_lat),
+    )
+
+
+def _lat_scale(ylim: tuple[float, float]) -> float:
+    """經度→等距長度的縮放 ``cos(平均緯度)``（避免極端值使比例失控）。"""
+
+    return max(float(np.cos(np.radians(0.5 * (ylim[0] + ylim[1])))), 0.05)
+
+
+def map_data_aspect(data: SiteFigureData, view: tuple[slice, slice]) -> float:
+    """地圖資料寬高比 ``(經度跨度 × cos 平均緯度) / 緯度跨度``（>1 為寬扁）。"""
+
+    xlim, ylim = _view_limits(data, view)
+    lat_extent = max(ylim[1] - ylim[0], 1.0e-12)
+    return (xlim[1] - xlim[0]) * _lat_scale(ylim) / lat_extent
+
+
+def _fit_panel(aspect: float, max_width: float, max_height: float, min_side: float = 0.5) -> tuple[float, float]:
+    """在 ``max_width × max_height`` 英吋內放入寬高比為 ``aspect`` 的最大地圖框。"""
+
+    width = max_width
+    height = width / aspect
+    if height > max_height:
+        height = max_height
+        width = height * aspect
+    return max(width, min_side), max(height, min_side)
+
+
+def _add_inch_axes(figure: Any, x: float, y: float, width: float, height: float) -> Any:
+    """以英吋（左下角起算）建立 axes。"""
+
+    fig_w, fig_h = figure.get_size_inches()
+    return figure.add_axes((x / fig_w, y / fig_h, width / fig_w, height / fig_h))
+
+
+def _prepare_map_axis(
+    axis: Any, data: SiteFigureData, view: tuple[slice, slice], coastline: CoastlineGeometry | None, *, max_ticks: int | None = None
+) -> None:
+    """設定經緯度軸標籤、等比例（考慮 cos 緯度）、海岸線疊圖與站點錨點（只有標記，沒有半徑圓）。"""
+
+    rows, cols = view
+    lon = data.lon[cols]
+    lat = data.lat[rows]
+    xlim, ylim = _view_limits(data, view)
+    axis.set_xlim(*xlim)
+    axis.set_ylim(*ylim)
     axis.set_xlabel(T["lon"])
     axis.set_ylabel(T["lat"])
-    axis.set_aspect("equal", adjustable="box")
+    axis.set_aspect(1.0 / _lat_scale(ylim), adjustable="box")
     axis.grid(alpha=0.2, linewidth=0.5)
     axis.ticklabel_format(useOffset=False, style="plain")
     if max_ticks is not None:
@@ -215,8 +291,22 @@ def _save(figure: Any, plt: Any, output_path: Path, dpi: int) -> None:
     plt.close(figure)
 
 
+# 地圖面板周邊需要的空間（英吋）：左側 y 軸標籤與刻度、色條間距／寬度／刻度與標籤、上方標題、下方 x 軸標籤。
+_LEFT_INCH = 0.95
+_CBAR_PAD_INCH = 0.10
+_CBAR_WIDTH_INCH = 0.16
+_CBAR_RIGHT_INCH = 0.85
+_TOP_TITLE_INCH = 0.42
+_BOTTOM_LABEL_INCH = 0.65
+_SUPTITLE_INCH = 0.62
+_MIN_FIGURE_WIDTH = 8.8
+
+
 def render_spatial(output_path: Path, data: SiteFigureData, *, coastline: CoastlineGeometry | None, footer: str, dpi: int = 150) -> Path:
-    """站點分析區內的 2×2 空間圖：曲線通過頻率、核心頻率、平均核心 s1、平均未截尾壽命。"""
+    """站點分析區內的 2×2 空間圖：曲線通過頻率、核心頻率、平均核心 s1、平均未截尾壽命。
+
+    圖面尺寸由地圖資料寬高比決定，四個面板與其色條各自貼齊主圖框，沒有大片空白。
+    """
 
     _, plt = _load_matplotlib()
     rows, cols = _view_extent(data)
@@ -227,23 +317,36 @@ def render_spatial(output_path: Path, data: SiteFigureData, *, coastline: Coastl
         (f"{T['mean_core_s1']} {S1_DAY_LABEL}", "mean_core_s1_day", S1_DAY_LABEL, "magma"),
         (T["mean_lifetime"], "mean_lifetime_hours", T["hour"], "plasma"),
     )
-    figure, axes = plt.subplots(2, 2, figsize=(13.0, 10.4))
-    figure.subplots_adjust(left=0.07, right=0.91, bottom=0.13, top=0.89, wspace=0.30, hspace=0.42)
+    panel_w, panel_h = _fit_panel(map_data_aspect(data, (rows, cols)), 4.6, 3.9)
+    column_pitch = _LEFT_INCH + panel_w + _CBAR_PAD_INCH + _CBAR_WIDTH_INCH + _CBAR_RIGHT_INCH
+    row_pitch = _TOP_TITLE_INCH + panel_h + _BOTTOM_LABEL_INCH
+    footer_h = _footer_height_inch(footer)
+    fig_w = max(2.0 * column_pitch, _MIN_FIGURE_WIDTH)
+    fig_h = _SUPTITLE_INCH + 2.0 * row_pitch + footer_h
+    x_offset = (fig_w - 2.0 * column_pitch) / 2.0
+    figure = plt.figure(figsize=(fig_w, fig_h))
     pairs: list[tuple[Any, Any]] = []
-    for axis, (title, key, label, cmap) in zip(axes.flat, fields, strict=True):
+    axes_list: list[Any] = []
+    for index, (title, key, label, cmap) in enumerate(fields):
+        row, column = divmod(index, 2)
+        x0 = x_offset + column * column_pitch + _LEFT_INCH
+        y0 = footer_h + (1 - row) * row_pitch + _BOTTOM_LABEL_INCH
+        axis = _add_inch_axes(figure, x0, y0, panel_w, panel_h)
+        cax = _add_inch_axes(figure, x0 + panel_w + _CBAR_PAD_INCH, y0, _CBAR_WIDTH_INCH, panel_h)
         vmin, vmax = data.colour_limits[key]
         masked = np.ma.masked_invalid(np.asarray(data.spatial_all[key], dtype=np.float64)[rows, cols])
         mesh = axis.pcolormesh(lon, lat, masked, shading="auto", cmap=cmap, vmin=vmin, vmax=vmax)
-        colorbar = figure.colorbar(mesh, ax=axis, pad=0.02)
+        colorbar = figure.colorbar(mesh, cax=cax)
         colorbar.set_label(label)
-        pairs.append((axis, colorbar.ax))
+        pairs.append((axis, cax))
         axis.set_title(title, fontsize=10)
         _prepare_map_axis(axis, data, (rows, cols), coastline)
-    axes.flat[0].plot([], [], marker="+", color="#37474f", linestyle="none", label=T["anchor"])
-    axes.flat[0].legend(loc="lower right", fontsize=7)
+        axes_list.append(axis)
+    axes_list[0].plot([], [], marker="+", color="#37474f", linestyle="none", label=T["anchor"])
+    axes_list[0].legend(loc="lower right", fontsize=7)
     align_colorbars_to_axes(figure, pairs)
-    figure.suptitle(f"{data.site_name_zh} — {T['spatial_title']}", fontsize=13)
-    figure.text(0.5, 0.02, footer, ha="center", fontsize=7)
+    figure.suptitle(f"{data.site_name_zh} — {T['spatial_title']}", fontsize=13, y=1.0 - 0.12 / fig_h, va="top")
+    _place_footer(figure, footer)
     _save(figure, plt, output_path, dpi)
     return output_path
 
@@ -251,20 +354,51 @@ def render_spatial(output_path: Path, data: SiteFigureData, *, coastline: Coastl
 def render_hotspots(
     output_path: Path, data: SiteFigureData, *, hotspot_quantile: float, coastline: CoastlineGeometry | None, footer: str, dpi: int = 150
 ) -> Path:
-    """曲線通過頻率場上標出熱點格點，並疊加核心頻率熱點輪廓；標題註明熱點面積。"""
+    """曲線通過頻率場上標出熱點格點，並以圓點標出核心頻率熱點格點；標題註明熱點面積。
+
+    圖面只顯示濾除小連通塊後的熱點（``SiteFigureData.hotspot_*_mask_filtered``），
+    統計欄位仍是未濾除的定義。圖框尺寸由地圖資料寬高比決定，色條與主圖等高。
+    """
 
     matplotlib, plt = _load_matplotlib()
     rows, cols = _view_extent(data)
     lon, lat = data.lon[cols], data.lat[rows]
     vmin, vmax = data.colour_limits["curve_pass_frequency"]
-    figure, axis = plt.subplots(figsize=(8.6, 8.2))
-    figure.subplots_adjust(left=0.11, right=0.90, bottom=0.17, top=0.88)
+
+    metrics = data.hotspot_metrics
+    percent = f"{100.0 * (1.0 - float(metrics['hotspot_quantile'])):g}"
+    area = float(metrics["hotspot_area_km2"])
+    threshold = metrics["hotspot_threshold_curve_pass_frequency"]
+    threshold_text = "n/a" if threshold is None else f"{float(threshold):.3g}"
+    extra = (
+        f"{T['footer_hotspot_area']} {area:,.1f} km²  {T['footer_hotspot_cells']} {int(metrics['hotspot_cell_count'])}"
+        f"  {T['footer_threshold']} {threshold_text}  {T['footer_min_cells']} {int(data.hotspot_min_cells)}"
+    )
+    full_footer = footer + "\n" + extra
+    title = (
+        f"{data.site_name_zh} — {T['hotspot_title']}\n"
+        f"{T['hotspot_top']} {percent}%，{T['hotspot_area']} {area:,.0f} km²"
+    )
+
+    panel_w, panel_h = _fit_panel(map_data_aspect(data, (rows, cols)), 6.6, 5.6)
+    content_w = _LEFT_INCH + panel_w + _CBAR_PAD_INCH + _CBAR_WIDTH_INCH + _CBAR_RIGHT_INCH
+    footer_h = _footer_height_inch(full_footer)
+    title_h = 0.62
+    fig_w = max(content_w, _MIN_FIGURE_WIDTH)
+    fig_h = 0.1 + title_h + panel_h + _BOTTOM_LABEL_INCH + footer_h
+    x0 = (fig_w - content_w) / 2.0 + _LEFT_INCH
+    y0 = footer_h + _BOTTOM_LABEL_INCH
+    figure = plt.figure(figsize=(fig_w, fig_h))
+    axis = _add_inch_axes(figure, x0, y0, panel_w, panel_h)
+    cax = _add_inch_axes(figure, x0 + panel_w + _CBAR_PAD_INCH, y0, _CBAR_WIDTH_INCH, panel_h)
     field = np.ma.masked_invalid(np.asarray(data.spatial_all["curve_pass_frequency"], dtype=np.float64)[rows, cols])
     mesh = axis.pcolormesh(lon, lat, field, shading="auto", cmap="Blues", vmin=vmin, vmax=vmax)
-    colorbar = figure.colorbar(mesh, ax=axis, pad=0.02)
+    colorbar = figure.colorbar(mesh, cax=cax)
     colorbar.set_label(f"{T['curve_pass_frequency']} ({T['fraction']})")
 
-    hot = np.asarray(data.hotspot_curve_mask, dtype=bool)[rows, cols]
+    curve_source = data.hotspot_curve_mask if data.hotspot_curve_mask_filtered is None else data.hotspot_curve_mask_filtered
+    core_source = data.hotspot_core_mask if data.hotspot_core_mask_filtered is None else data.hotspot_core_mask_filtered
+    hot = np.asarray(curve_source, dtype=bool)[rows, cols]
     handles = []
     if hot.any():
         overlay = np.ma.masked_where(~hot, np.ones(hot.shape))
@@ -272,44 +406,58 @@ def render_hotspots(
             lon, lat, overlay, shading="auto", cmap=matplotlib.colors.ListedColormap(["#e63946"]), alpha=0.55, zorder=3
         )
         handles.append(matplotlib.patches.Patch(facecolor="#e63946", alpha=0.55, label=T["hotspot_curve_legend"]))
-    core_hot = np.asarray(data.hotspot_core_mask, dtype=bool)[rows, cols]
-    if core_hot.any() and not core_hot.all():
-        axis.contour(lon, lat, core_hot.astype(np.float64), levels=[0.5], colors="#111111", linewidths=1.3, zorder=5)
-        handles.append(matplotlib.lines.Line2D([], [], color="#111111", linewidth=1.3, label=T["hotspot_core_legend"]))
+    core_hot = np.asarray(core_source, dtype=bool)[rows, cols]
+    if core_hot.any():
+        core_rows, core_cols = np.nonzero(core_hot)
+        cell_points = panel_w * 72.0 / max(lon.size, 1)
+        marker_size = float(np.clip(0.42 * cell_points, 2.0, 9.0))
+        axis.plot(
+            lon[core_cols], lat[core_rows], linestyle="none", marker="o", markersize=marker_size, markerfacecolor="#111111",
+            markeredgecolor="white", markeredgewidth=0.4, zorder=5,
+        )
+        handles.append(
+            matplotlib.lines.Line2D(
+                [], [], linestyle="none", marker="o", markersize=5, markerfacecolor="#111111", markeredgecolor="white", label=T["hotspot_core_legend"]
+            )
+        )
     _prepare_map_axis(axis, data, (rows, cols), coastline, max_ticks=5)
     if handles:
-        axis.legend(handles=handles, loc="lower right", fontsize=7)
-
-    metrics = data.hotspot_metrics
-    percent = f"{100.0 * (1.0 - float(metrics['hotspot_quantile'])):g}"
-    area = float(metrics["hotspot_area_km2"])
-    axis.set_title(
-        f"{data.site_name_zh} — {T['hotspot_title']}（{T['hotspot_top']} {percent}%，{T['hotspot_area']} {area:,.0f} km²）", fontsize=11
-    )
-    threshold = metrics["hotspot_threshold_curve_pass_frequency"]
-    threshold_text = "n/a" if threshold is None else f"{float(threshold):.3g}"
-    extra = (
-        f"{T['footer_hotspot_area']} {area:,.1f} km²  {T['footer_hotspot_cells']} {int(metrics['hotspot_cell_count'])}"
-        f"  {T['footer_threshold']} {threshold_text}"
-    )
-    figure.text(0.5, 0.02, footer + "\n" + extra, ha="center", fontsize=7)
+        axis.legend(handles=handles, loc="lower right", fontsize=7, framealpha=0.85)
+    axis.set_title(title, fontsize=11)
+    align_colorbars_to_axes(figure, ((axis, cax),))
+    _place_footer(figure, full_footer)
     _save(figure, plt, output_path, dpi)
     return output_path
 
 
 def render_seasonal(output_path: Path, data: SiteFigureData, *, coastline: CoastlineGeometry | None, footer: str, dpi: int = 150) -> Path:
-    """DJF/MAM/JJA/SON 曲線通過頻率小圖（站內共用色階），加季節強核心出現率與平均通過格點比例（含 CI）。"""
+    """DJF/MAM/JJA/SON 曲線通過頻率小圖（站內共用色階），加季節強核心出現率與平均通過格點比例（含 CI）。
+
+    四張地圖依資料寬高比取等大的面板，水平色條橫跨四張地圖且貼在其下方。
+    """
 
     _, plt = _load_matplotlib()
     rows, cols = _view_extent(data)
     lon, lat = data.lon[cols], data.lat[rows]
     vmin, vmax = data.colour_limits["curve_pass_frequency"]
-    figure = plt.figure(figsize=(14.0, 9.4))
-    grid = figure.add_gridspec(2, 8, height_ratios=[1.3, 1.0], left=0.06, right=0.97, bottom=0.14, top=0.90, wspace=0.9, hspace=0.42)
+    panel_w, panel_h = _fit_panel(map_data_aspect(data, (rows, cols)), 3.1, 3.7)
+    left_first = _LEFT_INCH
+    pitch = panel_w + 0.62
+    map_span = panel_w + 3.0 * pitch
+    content_w = left_first + map_span + 0.35
+    bar_title_h, bar_h, bar_label_h = 0.42, 2.5, 0.45
+    cbar_block_h = 0.25 + 0.16 + 0.55  # 與 x 軸標籤的間距、色條、刻度＋標籤
+    footer_h = _footer_height_inch(footer)
+    fig_w = max(content_w, 11.5)
+    fig_h = _SUPTITLE_INCH + _TOP_TITLE_INCH + panel_h + _BOTTOM_LABEL_INCH + cbar_block_h + bar_title_h + bar_h + bar_label_h + footer_h
+    x_offset = (fig_w - content_w) / 2.0
+    figure = plt.figure(figsize=(fig_w, fig_h))
+
+    map_bottom = fig_h - _SUPTITLE_INCH - _TOP_TITLE_INCH - panel_h
     map_axes = []
     mesh = None
     for index, season in enumerate(SEASONS):
-        axis = figure.add_subplot(grid[0, 2 * index : 2 * index + 2])
+        axis = _add_inch_axes(figure, x_offset + left_first + index * pitch, map_bottom, panel_w, panel_h)
         masked = np.ma.masked_invalid(np.asarray(data.spatial_seasons[season]["curve_pass_frequency"], dtype=np.float64)[rows, cols])
         mesh = axis.pcolormesh(lon, lat, masked, shading="auto", cmap="YlOrRd", vmin=vmin, vmax=vmax)
         axis.set_title(T[f"season_{season}"], fontsize=10)
@@ -318,14 +466,17 @@ def render_seasonal(output_path: Path, data: SiteFigureData, *, coastline: Coast
             axis.set_ylabel("")
         map_axes.append(axis)
     if mesh is not None:
-        colorbar = figure.colorbar(mesh, ax=map_axes, orientation="horizontal", fraction=0.045, pad=0.22, aspect=45)
+        cax = _add_inch_axes(figure, x_offset + left_first, map_bottom - _BOTTOM_LABEL_INCH - 0.25 - 0.16, map_span, 0.16)
+        colorbar = figure.colorbar(mesh, cax=cax, orientation="horizontal")
         colorbar.set_label(f"{T['curve_pass_frequency']} ({T['fraction']})")
 
+    bars_bottom = footer_h + bar_label_h
+    half_w = (content_w - left_first - 0.35 - 0.9) / 2.0
     x = np.arange(len(SEASONS))
     for column, (key, title) in enumerate(
         (("strong_core_occurrence_rate", T["strong_core_occurrence"]), ("mean_pass_cell_fraction", T["mean_pass_fraction"]))
     ):
-        axis = figure.add_subplot(grid[1, 4 * column : 4 * column + 4])
+        axis = _add_inch_axes(figure, x_offset + left_first + column * (half_w + 0.9), bars_bottom, half_w, bar_h)
         values, errors, counts = [], [], []
         for season in SEASONS:
             record = data.records.get(season)
@@ -343,8 +494,8 @@ def render_seasonal(output_path: Path, data: SiteFigureData, *, coastline: Coast
         for xi, count, level in zip(x, counts, tops, strict=True):
             axis.text(xi, level + 0.02 * top, f"n={count}" if count else T["no_data"], ha="center", va="bottom", fontsize=7)
         axis.set_ylim(0.0, top * 1.2)
-    figure.suptitle(f"{data.site_name_zh} — {T['seasonal_title']}", fontsize=13)
-    figure.text(0.5, 0.02, footer, ha="center", fontsize=7)
+    figure.suptitle(f"{data.site_name_zh} — {T['seasonal_title']}", fontsize=13, y=1.0 - 0.12 / fig_h, va="top")
+    _place_footer(figure, footer)
     _save(figure, plt, output_path, dpi)
     return output_path
 
@@ -353,8 +504,11 @@ def render_lifetime(output_path: Path, data: SiteFigureData, *, footer: str, dpi
     """壽命 CCDF（未截尾實線、含截尾虛線），以及吸引強度隨正規化年齡的演化（Kunz et al. 2024 Fig. 5b 風格）。"""
 
     _, plt = _load_matplotlib()
-    figure, (left, right) = plt.subplots(1, 2, figsize=(13.0, 5.6))
-    figure.subplots_adjust(left=0.07, right=0.97, bottom=0.22, top=0.86, wspace=0.25)
+    fig_w, fig_h = 13.0, 5.6
+    figure, (left, right) = plt.subplots(1, 2, figsize=(fig_w, fig_h))
+    figure.subplots_adjust(
+        left=0.07, right=0.97, bottom=(_footer_height_inch(footer) + 0.75) / fig_h, top=1.0 - 1.05 / fig_h, wspace=0.25
+    )
 
     x_u, y_u = _ccdf(data.lifetimes_uncensored)
     x_a, y_a = _ccdf(data.lifetimes_all)
@@ -367,6 +521,13 @@ def render_lifetime(output_path: Path, data: SiteFigureData, *, footer: str, dpi
         left.legend(fontsize=8)
     else:
         left.text(0.5, 0.5, T["no_data"], ha="center", va="center", transform=left.transAxes)
+    if x_u.size or x_a.size:
+        for threshold in data.lifetime_thresholds_hours:
+            left.axvline(float(threshold), color="#6c757d", linestyle=":", linewidth=1.0, zorder=1)
+            left.text(
+                float(threshold), 0.98, f"{_hours_label(threshold)} h", transform=left.get_xaxis_transform(), rotation=90, ha="right",
+                va="top", fontsize=7, color="#495057",
+            )
     left.set_xlabel(T["lifetime_hours"])
     left.set_ylabel(T["ccdf_ylabel"])
     left.set_title(T["ccdf_title"], fontsize=10)
@@ -383,11 +544,13 @@ def render_lifetime(output_path: Path, data: SiteFigureData, *, footer: str, dpi
     right.set_xlim(0.0, 1.0)
     right.set_xlabel(T["normalized_age"])
     right.set_ylabel(f"{T['mean_core_s1']} {S1_DAY_LABEL}")
-    right.set_title(f"{T['evolution_title']}\n{T['evolution_subtitle']}", fontsize=10)
+    right.set_title(
+        f"{T['evolution_title']}\n{T['evolution_subtitle']} ≥ {_hours_label(data.lifetime_evolution_min_hours)} {T['hour']}", fontsize=10
+    )
     right.grid(alpha=0.25)
 
-    figure.suptitle(f"{data.site_name_zh} — {T['lifetime_title']}", fontsize=13)
-    figure.text(0.5, 0.02, footer, ha="center", fontsize=7)
+    figure.suptitle(f"{data.site_name_zh} — {T['lifetime_title']}", fontsize=13, y=1.0 - 0.12 / fig_h, va="top")
+    _place_footer(figure, footer)
     _save(figure, plt, output_path, dpi)
     return output_path
 
@@ -397,8 +560,11 @@ def render_timeseries(output_path: Path, data: SiteFigureData, *, footer: str, d
 
     _, plt = _load_matplotlib()
     calendar, strong, passed = daily_series(data.day_stats)
-    figure, axes = plt.subplots(2, 1, figsize=(12.5, 7.6), sharex=True)
-    figure.subplots_adjust(left=0.08, right=0.97, bottom=0.18, top=0.90, hspace=0.18)
+    fig_w, fig_h = 12.5, 7.6
+    figure, axes = plt.subplots(2, 1, figsize=(fig_w, fig_h), sharex=True)
+    figure.subplots_adjust(
+        left=0.08, right=0.97, bottom=(_footer_height_inch(footer) + 0.75) / fig_h, top=1.0 - 0.75 / fig_h, hspace=0.18
+    )
     for axis, series, label, color in (
         (axes[0], strong, T["strong_core_daily"], "#c1121f"),
         (axes[1], passed, T["pass_fraction_daily"], "#1b4965"),
@@ -413,8 +579,8 @@ def render_timeseries(output_path: Path, data: SiteFigureData, *, footer: str, d
         axis.set_ylim(bottom=0.0)
         axis.grid(alpha=0.25)
     axes[1].set_xlabel(T["date"])
-    figure.suptitle(f"{data.site_name_zh} — {T['timeseries_title']}", fontsize=13)
-    figure.text(0.5, 0.02, footer, ha="center", fontsize=7)
+    figure.suptitle(f"{data.site_name_zh} — {T['timeseries_title']}", fontsize=13, y=1.0 - 0.12 / fig_h, va="top")
+    _place_footer(figure, footer)
     _save(figure, plt, output_path, dpi)
     return output_path
 

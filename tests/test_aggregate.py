@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import dataclasses
 import json
 import shutil
 import subprocess
@@ -343,6 +344,9 @@ def test_aggregate_end_to_end_per_site_outputs(built_run: tuple[Path, Path, Path
         assert value["strong_core_threshold_day"] == pytest.approx(value["strong_core_threshold_sinv"] * 86_400.0)
     assert thresholds["nanwan"]["strong_core_threshold_sinv"] == pytest.approx(_expected_c_threshold(track_root, detect_root, 0.10))
     assert set(manifest["colour_limits"]) == set(sites)
+    assert manifest["hotspot_min_cells"] == 3
+    assert manifest["lifetime_thresholds_hours"] == [6.0, 12.0, 24.0]
+    assert manifest["lifetime_evolution_min_hours"] == 12.0
 
     rows = _read_csv_rows(output_dir / "site_statistics.csv")
     assert {r["scope"] for r in rows} == {"site_area"}
@@ -368,6 +372,9 @@ def test_aggregate_end_to_end_per_site_outputs(built_run: tuple[Path, Path, Path
     assert np.all(gongliao["site_mask"] | guishan["site_mask"])
     for archive in (gongliao, guishan):
         assert {"site_mask", "hotspot_curve_mask", "hotspot_core_mask", "curve_pass_frequency", "n_valid"} <= set(archive)
+        assert {"hotspot_curve_mask_filtered", "hotspot_core_mask_filtered"} <= set(archive)
+        assert not np.any(archive["hotspot_curve_mask_filtered"] & ~archive["hotspot_curve_mask"])
+        assert not np.any(archive["hotspot_core_mask_filtered"] & ~archive["hotspot_core_mask"])
         assert np.all(np.isnan(archive["curve_pass_frequency"][~archive["site_mask"]]))
         assert not np.any(archive["hotspot_curve_mask"] & ~archive["site_mask"])
     # 逐站色階＝該站自己 2–98 百分位（不與他站共用）
@@ -963,3 +970,122 @@ def test_daily_series_marks_missing_days_as_nan() -> None:
     assert np.all(np.isnan(strong[1:3])) and np.all(np.isnan(passed[1:3]))
     assert passed[3] == pytest.approx(0.2)
     assert aggregate_figures.daily_series({})[0].size == 0
+
+
+# ---------------------------------------------------------------------------
+# 圖面版面、熱點小塊濾除與壽命門檻旗標
+# ---------------------------------------------------------------------------
+
+
+def test_remove_small_components_uses_four_connectivity() -> None:
+    """4-連通：對角相鄰不算同一塊；小於 min_cells 的塊被移除，輸入不被修改。"""
+
+    mask = np.zeros((6, 6), dtype=bool)
+    mask[0, 0] = mask[1, 1] = True  # 只有對角相接 -> 兩個 1 格塊
+    mask[3:5, 3:5] = True  # 4 格方塊
+    mask[5, 0:3] = True  # 3 格直線
+    original = mask.copy()
+    kept = agg.remove_small_components(mask, 3)
+    assert np.array_equal(mask, original)
+    assert not kept[0, 0] and not kept[1, 1]
+    assert kept[3:5, 3:5].all() and kept[5, 0:3].all()
+    assert int(kept.sum()) == 7
+    assert int(agg.remove_small_components(mask, 4).sum()) == 4
+    assert np.array_equal(agg.remove_small_components(mask, 1), mask)
+
+
+def test_site_hotspots_statistics_stay_unfiltered_but_masks_filtered_are_added() -> None:
+    """統計沿用未濾除遮罩；另附濾除後遮罩。"""
+
+    shape = (5, 5)
+    site_mask = np.ones(shape, dtype=bool)
+    accumulator = agg._new_spatial_accumulator(shape)
+    accumulator["n_valid"][:] = 10
+    accumulator["curve_pass_count"][0, 0] = 9  # 孤立高值
+    accumulator["curve_pass_count"][3:5, 3:5] = 8  # 4 格連通塊
+    finalized = agg._finalize_spatial(shape, accumulator)
+    hot = agg._site_hotspots(accumulator, finalized, site_mask, np.full(shape, 1.0e6), 0.75, 3)
+    assert hot["metrics"]["hotspot_cell_count"] == int(hot["curve_mask"].sum())
+    assert hot["curve_mask"][0, 0] and not hot["curve_mask_filtered"][0, 0]
+    assert hot["curve_mask_filtered"][3:5, 3:5].all()
+
+
+def test_lifetime_flags_drive_columns_and_evolution_threshold() -> None:
+    """壽命門檻欄位名稱與演化最短壽命跟隨旗標。"""
+
+    assert agg.lifetime_fraction_column(48.0) == "track_frac_uncensored_ge_48h"
+    assert agg.lifetime_fraction_column(1.5) == "track_frac_uncensored_ge_1.5h"
+    assert agg.site_stat_fieldnames() == list(agg.SITE_STAT_FIELDNAMES)
+    names = agg.site_stat_fieldnames([48.0, 72.0, 168.0])
+    assert "track_frac_uncensored_ge_72h" in names and "track_frac_uncensored_ge_6h" not in names
+    record = agg._finalize_site_record(
+        "gongliao", "all", {**agg._new_site_accumulator(), "track_lifetimes": [10.0, 50.0, 80.0, 200.0]},
+        site_area_km2=1.0, site_name_zh="貢寮", strong_threshold_sinv=None,
+        hotspot_metrics={}, bootstrap_reps=10, rng=np.random.default_rng(0), lifetime_thresholds_hours=[48.0, 72.0, 168.0],
+    )
+    assert record["track_frac_uncensored_ge_48h"] == pytest.approx(0.75)
+    assert record["track_frac_uncensored_ge_168h"] == pytest.approx(0.25)
+    assert "track_frac_uncensored_ge_6h" not in record
+
+
+def test_cli_registers_new_aggregate_flags() -> None:
+    parser = argparse.ArgumentParser()
+    agg.register_subcommands(parser.add_subparsers())
+    args = parser.parse_args(
+        ["aggregate", "--track-root", "a", "--detect-root", "b", "--output-dir", "c",
+         "--lifetime-thresholds-hours", "48", "72", "168", "--lifetime-evolution-min-hours", "72", "--hotspot-min-cells", "5"]
+    )
+    assert args.lifetime_thresholds_hours == [48.0, 72.0, 168.0]
+    assert args.lifetime_evolution_min_hours == 72.0 and args.hotspot_min_cells == 5
+
+
+@pytest.mark.filterwarnings("ignore")
+def test_aggregate_custom_lifetime_flags_end_to_end(built_run: tuple[Path, Path, Path], tmp_path: Path, fake_font: CJKFontSelection) -> None:
+    _root, track_root, detect_root = built_run
+    output_dir = tmp_path / "custom"
+    assert agg.run_aggregate(
+        _namespace(track_root, detect_root, output_dir, lifetime_thresholds_hours=[48.0, 72.0], lifetime_evolution_min_hours=72.0, hotspot_min_cells=1)
+    ) == 0
+    manifest = _manifest(output_dir)
+    assert manifest["lifetime_thresholds_hours"] == [48.0, 72.0]
+    assert manifest["lifetime_evolution_min_hours"] == 72.0 and manifest["hotspot_min_cells"] == 1
+    header = (output_dir / "site_statistics.csv").read_text(encoding="utf-8").splitlines()[0].split(",")
+    assert "track_frac_uncensored_ge_48h" in header and "track_frac_uncensored_ge_72h" in header
+    assert "track_frac_uncensored_ge_6h" not in header
+
+
+@pytest.mark.filterwarnings("ignore")
+def test_map_figures_have_tight_layout_and_aligned_colorbars(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """熱點圖：色條與主圖等高、圖框由資料寬高比決定（寬扁地圖不會留下巨大空白）、註腳不壓到 axes。"""
+
+    import matplotlib.figure
+    import matplotlib.text
+
+    data = _synthetic_figure_data()
+    data = dataclasses.replace(
+        data, lon=np.linspace(121.0, 123.0, data.lon.size), hotspot_min_cells=3,
+        hotspot_curve_mask_filtered=data.hotspot_curve_mask, hotspot_core_mask_filtered=data.hotspot_core_mask,
+    )
+    captured: dict[str, object] = {}
+    original_savefig = matplotlib.figure.Figure.savefig
+
+    def _capture(self, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        if str(args[0]).endswith("_hotspots.png"):
+            captured["figure"] = self
+            renderer = self.canvas.get_renderer()
+            captured["footer"] = [t.get_window_extent(renderer) for t in self.texts if "n=" in t.get_text()]
+            captured["axes"] = [(a, a.get_position(), a.get_tightbbox(renderer)) for a in self.axes]
+        return original_savefig(self, *args, **kwargs)
+
+    monkeypatch.setattr(matplotlib.figure.Figure, "savefig", _capture)
+    aggregate_figures.render_site_figures(
+        tmp_path, data, font_selection=FAKE_FONT, coastline=None, state_label="MODEL_ONLY", param_id="p", period_label="x", dpi=50
+    )
+    (main, main_pos, _), (cbar, cbar_pos, _) = captured["axes"]  # type: ignore[misc]
+    assert cbar_pos.y0 == pytest.approx(main_pos.y0, abs=1e-3) and cbar_pos.height == pytest.approx(main_pos.height, abs=1e-3)
+    assert main_pos.height > 0.3  # 地圖佔圖高的合理比例
+    footer_boxes = captured["footer"]
+    assert footer_boxes
+    for _axis, _pos, tight in captured["axes"]:  # type: ignore[misc]
+        for box in footer_boxes:  # type: ignore[attr-defined]
+            assert box.y1 <= tight.y0 + 1.0

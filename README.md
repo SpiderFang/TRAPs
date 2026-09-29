@@ -202,6 +202,21 @@ Arial Unicode MS）解析，並以 FreeType charmap 檢查涵蓋圖面所有固�
 `state_label`／科學狀態，圖說與 JSON 一律標示「MODEL_ONLY 表層短期吸引潛勢」或
 `PILOT_ONLY`，不是實測海廢濃度或污染來源。
 
+### 去潮汐日平均產品（build-daily-fields）
+
+逐時流場以潮汐為主；TRAP 文獻使用日快照。`build-daily-fields` 由逐時 `ocm_surface` 建立
+同 schema 的 25 h 置中等權平均日產品（每日 12:00 UTC 為目標時刻、視窗內至少 23 小時、格點須
+全視窗有效；`cache_kind = derived_daily_mean`），`detect-shards`／`track-period`／`aggregate`
+可直接在其上執行（追蹤請用 `--nominal-time-step-hours 24 --tracking-max-time-gap-hours 36`）：
+
+```bash
+python -m traps build-daily-fields --surface-root "$OCM_SURFACE_ROOT" \
+  --domain-id hsinchu_cache_v3 --output-root "$DAILY_ROOT" --months 202401-202512 --resume
+```
+
+25 h 平均強烈抑制 M2/S2/K1/O1，但不是理想低通；濾波參數與被省略日期記在各月 `metadata.json`。
+SERVER 用法見 `docs/operations/SERVER_RUNBOOK.md` 的 DAILY 一節（`TRAPS_FIELD=daily25h`）。
+
 ## 目前產物、驗證與限制
 
 需求 PDF、四篇文獻原件與紅框副本及來源清冊存於 [`data/literature/`](data/literature/README.md)；程式佇列與驗收界線見 [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md)，[模組流程圖與文獻圖型對照](docs/MODULE_FLOW_AND_FIGURE_AUDIT.md) 逐項標明已可試跑和有資料 gate 的圖型。本機四區各 24 時刻的上游 `trial_partial_month` 用於來源與海岸 sidecar 檢查；四區各取同一 2025-01-01 UTC 四時刻進行檢出，並以[海岸線與等高色條版圖組](outputs/pilot/literature_figures_four_area_4frames_v5_colorbar/figure_availability.json)及[單時刻圖](outputs/pilot/snapshot_a_20250101_t0100_v5_colorbar/snapshot_000000.png)核對 A–D 圖面。這些產物一律是 `PILOT_ONLY` 工程試算，不是 2024–2025 正式 TRAP 統計。全套測試 61 項通過，圖組 27 個 artifact 的 SHA-256 與來源 catalog、研究設計設定雜湊已核對；四區科學摘要 JSON、五站摘要及概念圖和前版位元組一致。正式資料全期計算、跨月份生命週期、跨參數 robust 分類、速度單位確認，以及獨立表層觀測與潮相對照仍未完成；不能據此宣稱海廢濃度或污染來源。

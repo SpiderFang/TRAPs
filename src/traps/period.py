@@ -1160,6 +1160,11 @@ def register_subcommands(subparsers: argparse._SubParsersAction) -> None:
 
     _aggregate.register_subcommands(subparsers)
 
+    # 日平均（去潮汐）產品建置，與 detect-shards/track-period 同層，輸出相同 OCM schema。
+    from . import daily_fields as _daily_fields
+
+    _daily_fields.register_subcommands(subparsers)
+
 
 __all__ = [
     "STOP_REASON_CODES",

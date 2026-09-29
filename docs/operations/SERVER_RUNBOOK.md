@@ -178,6 +178,42 @@ scripts/run_traps_server.sh PREPARE
 `DETECT` 在開始平行跑工作前，會自動先做一次同樣的健檢，任何一項沒過就不會啟
 動任何 detect 工作。
 
+## DAILY：建立去潮汐 25 h 日平均產品（可選）
+
+逐時表層流以潮汐為主；TRAP 文獻（Kunz et al. 2024）使用每日、去潮汐的快照。`DAILY`
+模式把已 staging 的逐時 `$TRAPS_LOCAL_DATA/ocm_surface` 轉成**相同 OCM schema** 的日產品
+`$TRAPS_LOCAL_DATA/ocm_surface_daily25h`，之後 DETECT / TRACK / AGGREGATE 不需改程式：
+
+```bash
+scripts/run_traps_server.sh DAILY                       # 各 domain 平行，--resume 可續跑
+export TRAPS_FIELD=daily25h TRAPS_PARAM_ID=daily25h_r0  # 建議用獨立 param id，避免與逐時結果混淆
+scripts/run_traps_server.sh PREPARE                     # 額外檢查日產品每月 _SUCCESS
+scripts/run_traps_server.sh DETECT && scripts/run_traps_server.sh TRACK
+TRAPS_AGGREGATE_ARGS="--no-figures" scripts/run_traps_server.sh AGGREGATE   # 額外旗標會原樣傳給 aggregate
+```
+
+每個 domain 呼叫：
+
+```
+$VENV_PY -m traps build-daily-fields --surface-root $TRAPS_LOCAL_DATA/ocm_surface \
+  --domain-id <domain> --output-root $TRAPS_LOCAL_DATA/ocm_surface_daily25h \
+  --months $TRAPS_MONTHS --window-hours 25 --min-hours 23 --sample-hour-utc 12 --resume
+```
+
+方法：每個 UTC 日以 12:00 為目標時刻，取正式逐時時間軸（月份串接、穩定排序、重複 UTC 保留較晚
+月份）上 |t − T| ≤ 12 h 的樣本（即當日 00:00 至隔日 00:00，可跨月讀鄰月）做等權平均；視窗內
+樣本少於 23 則該日省略（不補值）；格點須在視窗內所有實際存在的小時皆有效才有效。25 h 平均
+（Godin 式單次）大幅抑制 M2/S2/K1/O1 但不是理想低通。輸出 `months/<YYYYMM>` 的
+`metadata.json` 為 `cache_kind = derived_daily_mean`、`status = ready`，`derived_from`
+記錄來源月份 metadata 路徑與 SHA-256、濾波參數、逐日存在小時數與被省略日期；每月另有
+`_SUCCESS`，`--resume` 只在濾波參數、來源 SHA-256 與陣列 SHA-256 皆相符時略過。`grid/`
+（含 ocean mask sidecar）原樣複製，來源逐時資料從不被修改。
+
+`TRAPS_FIELD=daily25h` 時 DETECT 讀日產品，TRACK 額外傳入
+`--nominal-time-step-hours 24 --tracking-max-time-gap-hours 36
+--tracking-max-core-distance-m ${TRAPS_TRACK_CORE_M:-10000}
+--tracking-max-curve-distance-m ${TRAPS_TRACK_CURVE_M:-20000}`；`hourly`（預設）行為不變。
+
 ## 執行 DETECT / TRACK / AGGREGATE
 
 三個模式都建議在 `tmux` 裡跑，避免 SSH 斷線中斷長時間的批次工作：

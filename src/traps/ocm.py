@@ -32,6 +32,10 @@ STANDARD_CACHE_KINDS = frozenset({"standard_month", "standard_partial_month"})
 TRIAL_CACHE_KIND = "trial_partial_month"
 """上游以少量日檔產生的 pilot 快取種類，必須明示允許才可讀取。"""
 
+DERIVED_DAILY_CACHE_KIND = "derived_daily_mean"
+"""``build-daily-fields`` 產生的潮汐濾波日平均衍生快取；視為正式（非 pilot）輸入，
+但 status 必須是 ``ready``，且不可再作為 ``build-daily-fields`` 的來源。"""
+
 _REQUIRED_MONTH_FILES = {
     "time_utc_ns": "time_utc_ns.npy",
     "u": "u_surface_mps.npy",
@@ -300,6 +304,9 @@ def _validate_metadata(
     if cache_kind in STANDARD_CACHE_KINDS:
         _require(status == "ready", f"正式 OCM cache 的 status 必須是 ready，目前為 {status!r}")
         pilot_only = False
+    elif cache_kind == DERIVED_DAILY_CACHE_KIND:
+        _require(status == "ready", f"衍生日平均 OCM cache 的 status 必須是 ready，目前為 {status!r}")
+        pilot_only = False
     elif cache_kind == TRIAL_CACHE_KIND:
         _require(status in {"trial_ready", "ready"}, "trial_partial_month 的 status 必須是 trial_ready 或 ready")
         _require(allow_trial_pilot, "trial_partial_month 只能在 allow_trial_pilot=True 時讀取")
@@ -522,6 +529,7 @@ def open_month(
 
 __all__ = [
     "CACHE_SCHEMA_VERSION",
+    "DERIVED_DAILY_CACHE_KIND",
     "STANDARD_CACHE_KINDS",
     "TRIAL_CACHE_KIND",
     "SurfaceMonth",
