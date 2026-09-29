@@ -18,6 +18,12 @@ detect-root（`traps.period.shard.v1`），核對已載入 domain 共用同一�
 `state_label`／`science_status`，輸出只代表模型內部「表層短期吸引潛勢」，不是實測
 海廢濃度或污染來源。
 
+track 壽命的解讀：``track-period --track-strong-quantile q`` 只追蹤各站最強的核心（門檻與本模組的
+強核心門檻同一母體定義），此時壽命統計指「強核心結構（各站前 q）」，記錄於 manifest
+``track_core_filter`` 與圖表文字。壽命應一律對照 ``--null-track-root`` 的時間置換 null：
+逐站在 stratum ``all`` 加上 ``null_``／``excess_``／``ratio_`` 欄位（超額＝真實比例減 null 比例），
+壽命圖疊上 null CCDF；null 必須與真實追蹤同設定，僅 seed 不同，否則拒絕。
+
 成果圖使用 :mod:`traps.report_font` 解析的繁體中文字型（找不到合格字型即 fail closed，
 除非 ``--no-figures``），字型選擇紀錄寫入 manifest。
 """
@@ -50,6 +56,9 @@ from .period import (
     _prepare_output_dir,
     _success_verified,
     _write_manifest_with_checksum,
+    _canonical_valid_snapshot_indices_by_month,
+    _site_core_s1_for_month as _period_site_core_s1_for_month,
+    _thresholds_from_core_values,
 )
 from .sites import DEFAULT_STUDY_DESIGN_PATH, load_study_design, site_masks
 
@@ -134,8 +143,12 @@ def _ragged_gather(offsets: np.ndarray, selected_rows: np.ndarray, values: np.nd
 # ---------------------------------------------------------------------------
 
 
-def _load_track_domain(track_root: Path, domain_id: str) -> dict[str, Any]:
-    """讀取並驗證一個 domain 的 stage-2 `track-period` 輸出。"""
+def _load_track_domain(track_root: Path, domain_id: str, *, expect_null: bool = False) -> dict[str, Any]:
+    """讀取並驗證一個 domain 的 stage-2 `track-period` 輸出。
+
+    主要 ``--track-root`` 必須是真實追蹤（``null_model`` 為空）；``--null-track-root`` 則以
+    ``expect_null=True`` 載入，且必須帶 ``null_model``（時間置換對照組）。
+    """
 
     domain_dir = track_root / domain_id
     manifest = _success_verified(domain_dir)
@@ -143,10 +156,16 @@ def _load_track_domain(track_root: Path, domain_id: str) -> dict[str, Any]:
     assert manifest is not None
     _require(manifest.get("schema_version") == TRACK_SCHEMA_VERSION, f"{domain_id} track manifest schema_version 不符")
     _require(manifest.get("domain_id") == domain_id, f"{domain_id} track manifest domain_id 不符")
-    _require(
-        manifest.get("null_model") is None,
-        f"{domain_id} track manifest 含 null_model（{manifest.get('null_model')}）：null 對照組不可餵入統計",
-    )
+    if expect_null:
+        _require(
+            isinstance(manifest.get("null_model"), Mapping) and manifest["null_model"].get("type") == "time_shuffle",
+            f"{domain_id} 的 --null-track-root 輸入缺少 null_model（不是 --shuffle-seed 的輸出）: {domain_dir}",
+        )
+    else:
+        _require(
+            manifest.get("null_model") is None,
+            f"{domain_id} track manifest 含 null_model（{manifest.get('null_model')}）：null 對照組不可餵入統計，請改用 --null-track-root",
+        )
     with np.load(domain_dir / "canonical_snapshots.npz") as archive:
         canonical = {name: np.array(archive[name]) for name in archive.files}
     with np.load(domain_dir / "track_observations.npz") as archive:
@@ -195,6 +214,25 @@ def _verify_shard_manifests(
     return manifests
 
 
+def _filter_quantile(track_core_filter: Mapping[str, Any] | None) -> float | None:
+    """``track_core_filter`` 記錄的分位數；沒有篩選（追蹤全部合格核心）時為 ``None``。"""
+
+    if not track_core_filter:
+        return None
+    return float(track_core_filter["quantile"])
+
+
+def lifetime_scope_text(track_core_filter: Mapping[str, Any] | None) -> str:
+    """壽命統計對象的中文說明（圖表與 site_statistics.json 共用同一字串）。"""
+
+    from .report_font import FIGURE_TEXT as T
+
+    quantile = _filter_quantile(track_core_filter)
+    if quantile is None:
+        return T["all_qualified_structures"]
+    return f"{T['strong_core_structures']}（{T['per_site_top']} {quantile * 100.0:g}%）"
+
+
 def _validate_cross_domain_consistency(domain_context: Mapping[str, dict[str, Any]]) -> dict[str, Any]:
     """核對所有已載入 domain 共用同一組 param_id／detection_config／tracking_config／
     min_coverage／state_label；拒絕 PILOT_ONLY 與正式資料混用。
@@ -219,7 +257,27 @@ def _validate_cross_domain_consistency(domain_context: Mapping[str, dict[str, An
             context["state_label"] == first["state_label"],
             f"aggregate 不可混用 PILOT_ONLY 與正式資料（{first_id}={first['state_label']!r}，{domain_id}={context['state_label']!r}）",
         )
+        _require(
+            _filter_quantile(context["track_core_filter"]) == _filter_quantile(first["track_core_filter"]),
+            f"{domain_id} 與 {first_id} 的 track_core_filter（--track-strong-quantile）不一致，無法合併",
+        )
+    merged_thresholds: dict[str, Any] = {}
+    for context in domain_context.values():
+        track_filter = context["track_core_filter"]
+        if track_filter:
+            merged_thresholds.update(track_filter.get("thresholds") or {})
+    first_filter = first["track_core_filter"]
     return {
+        "track_core_filter": (
+            None
+            if not first_filter
+            else {
+                "type": first_filter.get("type"),
+                "quantile": float(first_filter["quantile"]),
+                "population": first_filter.get("population"),
+                "thresholds": merged_thresholds,
+            }
+        ),
         "param_id": first["param_id"],
         "detection_config": first["detection_config"],
         "min_coverage": float(first["min_coverage"]),
@@ -268,20 +326,6 @@ def _build_domain_masks(
 # ---------------------------------------------------------------------------
 
 
-def _canonical_valid_snapshot_indices_by_month(canonical: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
-    """回傳每個月份下，canonical 且 coverage_pass 的 snapshot_index 陣列。"""
-
-    month_codes = canonical["month"]
-    snapshot_index = canonical["snapshot_index"]
-    coverage_pass = canonical["coverage_pass"]
-    result: dict[str, np.ndarray] = {}
-    for month_code in np.unique(month_codes):
-        month = f"{int(month_code):06d}"
-        rows = (month_codes == month_code) & coverage_pass
-        result[month] = np.sort(snapshot_index[rows])
-    return result
-
-
 def _site_core_s1_for_month(
     detect_root: Path,
     domain_id: str,
@@ -290,42 +334,14 @@ def _site_core_s1_for_month(
     flat_site_masks: Mapping[str, np.ndarray],
     nx: int,
 ) -> dict[str, np.ndarray]:
-    """只讀 detections.npz 少數欄位，回傳該月份各站分析區內、合格且 canonical valid 的核心 s1。"""
+    """該月份各站分析區內、合格且 canonical valid 的核心 s1。
 
-    if valid_snapshot_indices.size == 0:
-        return {site_id: np.zeros(0, dtype=np.float64) for site_id in flat_site_masks}
-    with np.load(detect_root / domain_id / month / "detections.npz") as archive:
-        snapshot_index = np.array(archive["snapshot_index"])
-        is_qualified = np.array(archive["is_qualified"])
-        core_row = np.array(archive["core_row"])
-        core_col = np.array(archive["core_col"])
-        core_s1 = np.array(archive["core_s1_sinv"])
-    selected = is_qualified & np.isin(snapshot_index, valid_snapshot_indices)
-    flat = core_row.astype(np.int64) * np.int64(nx) + core_col.astype(np.int64)
-    return {site_id: core_s1[selected & mask_flat[flat]] for site_id, mask_flat in flat_site_masks.items()}
-
-
-def _thresholds_from_core_values(core_s1_by_site: Mapping[str, np.ndarray], strong_quantile: float) -> dict[str, dict[str, Any]]:
-    """各站獨立以自己的核心 s1 計算強核心門檻（s⁻¹ 與 day⁻¹）；站與站之間完全不 pooled。
-
-    ``s1`` 越負代表吸引越強，因此門檻是該站核心 s1 的 ``strong_quantile`` 分位數，
-    強核心定義為 ``s1 <= 門檻``。站內沒有合格核心時門檻為 ``None``。
+    母體定義與 ``track-period --track-strong-quantile`` 共用 :func:`traps.period._site_core_s1_for_month`
+    （以及 ``_thresholds_from_core_values``、``_canonical_valid_snapshot_indices_by_month``），
+    因此兩處的逐站強核心門檻必然相同。
     """
 
-    thresholds: dict[str, dict[str, Any]] = {}
-    for site_id, values in core_s1_by_site.items():
-        finite = np.asarray(values, dtype=np.float64)
-        finite = finite[np.isfinite(finite)]
-        if finite.size == 0:
-            thresholds[site_id] = {"threshold_sinv": None, "threshold_day": None, "core_count": 0}
-            continue
-        threshold_sinv = float(np.quantile(finite, strong_quantile))
-        thresholds[site_id] = {
-            "threshold_sinv": threshold_sinv,
-            "threshold_day": threshold_sinv * SECONDS_PER_DAY,
-            "core_count": int(finite.size),
-        }
-    return thresholds
+    return _period_site_core_s1_for_month(detect_root / domain_id / month, valid_snapshot_indices, flat_site_masks, nx)
 
 
 def _compute_site_thresholds(
@@ -638,6 +654,128 @@ def _process_track_lifetimes(
 
 
 # ---------------------------------------------------------------------------
+# 時間置換 null 對照（--null-track-root）：同一規則的壽命統計與超額
+# ---------------------------------------------------------------------------
+
+
+def _track_lifetimes_by_site(
+    context: Mapping[str, Any], site_masks_2d: Mapping[str, np.ndarray], grid: Mapping[str, Any]
+) -> dict[str, list[float]]:
+    """依與真實 track 完全相同的規則，回傳各站（stratum ``all``）未截尾 track 壽命（小時）。
+
+    track 依「首個落在該站分析區內的觀測」指派給該站（只要有任一觀測在站內即屬於該站）；
+    僅計未截尾 track。這是 :func:`_process_track_lifetimes` 中 ``all`` 分層 ``track_lifetimes``
+    的獨立重現，供 null 對照組使用（null 沒有對應的 detect-root 逐格統計）。
+    """
+
+    nx = grid["shape"][1]
+    observations = context["observations"]
+    tracks_by_id = context["tracks_by_id"]
+    result: dict[str, list[float]] = {site_id: [] for site_id in site_masks_2d}
+    if observations["track_id"].size == 0:
+        return result
+    cols = _nearest_indices(grid["x_m_axis"], observations["core_x_m"])
+    rows = _nearest_indices(grid["y_m_axis"], observations["core_y_m"])
+    flat = rows.astype(np.int64) * np.int64(nx) + cols.astype(np.int64)
+    flat_masks = {site_id: mask.reshape(-1) for site_id, mask in site_masks_2d.items()}
+    for segment in _track_segments(observations):
+        track = tracks_by_id.get(int(observations["track_id"][segment[0]]))
+        if track is None or track["left_censored"] or track["right_censored"]:
+            continue
+        segment_flat = flat[segment]
+        for site_id, mask_flat in flat_masks.items():
+            if np.any(mask_flat[segment_flat]):
+                result[site_id].append(float(track["lifetime_hours"]))
+    return result
+
+
+def _validate_null_against_real(
+    real: Mapping[str, Any], null: Mapping[str, Any], *, domain_id: str, null_root: Path
+) -> None:
+    """null 對照組必須與真實追蹤同 detection／tracking 設定與 track_core_filter，僅 seed 不同。"""
+
+    real_manifest, null_manifest = real["manifest"], null["manifest"]
+    where = f"--null-track-root {null_root} / {domain_id}"
+    for key in ("param_id", "state_label", "tracking_config", "nominal_time_step_hours", "available_months"):
+        _require(real_manifest.get(key) == null_manifest.get(key), f"{where}: {key} 與真實 track-root 不一致，拒絕作為對照組")
+    # shard manifest 的 SHA-256 完全相同 => detection_config／min_coverage／偵測輸入相同。
+    _require(
+        real_manifest.get("shard_manifests") == null_manifest.get("shard_manifests"),
+        f"{where}: shard_manifests（偵測輸入與 detection_config）與真實 track-root 不一致，拒絕作為對照組",
+    )
+    real_filter, null_filter = real_manifest.get("track_core_filter"), null_manifest.get("track_core_filter")
+    _require(
+        _filter_quantile(real_filter) == _filter_quantile(null_filter),
+        f"{where}: track_core_filter（--track-strong-quantile）與真實 track-root 不一致，拒絕作為對照組",
+    )
+    if real_filter:
+        real_thresholds = {site: value.get("threshold_sinv") for site, value in (real_filter.get("thresholds") or {}).items()}
+        null_thresholds = {site: value.get("threshold_sinv") for site, value in (null_filter.get("thresholds") or {}).items()}
+        _require(real_thresholds == null_thresholds, f"{where}: track_core_filter 各站門檻與真實 track-root 不一致，拒絕作為對照組")
+
+
+def _lifetime_summary(lifetimes: Sequence[float], thresholds_hours: Sequence[float]) -> dict[str, Any]:
+    """一組未截尾壽命的 n、median、p90 與各門檻的 frac(>= h)；n=0 時統計為 ``None``。"""
+
+    n = len(lifetimes)
+    values = np.asarray(lifetimes, dtype=np.float64)
+    return {
+        "n": n,
+        "median": _quantile_or_none(lifetimes, 0.5),
+        "p90": _quantile_or_none(lifetimes, 0.9),
+        "frac": {lifetime_fraction_column(h): (float(np.mean(values >= h)) if n else None) for h in thresholds_hours},
+    }
+
+
+def null_column_names(lifetime_thresholds_hours: Sequence[float]) -> list[str]:
+    """``--null-track-root`` 給定時附加在 site_statistics 的欄位（只有 stratum ``all`` 有值）。"""
+
+    fractions = [lifetime_fraction_column(h) for h in lifetime_thresholds_hours]
+    return [
+        "null_n_seeds",
+        "null_n_uncensored",
+        "null_median_lifetime_hours",
+        "null_p90_lifetime_hours",
+        *[f"null_{name}" for name in fractions],
+        *[f"excess_{name}" for name in fractions],
+        *[f"ratio_{name}" for name in fractions],
+    ]
+
+
+def _mean_or_none(values: Sequence[float | None]) -> float | None:
+    finite = [float(v) for v in values if v is not None]
+    return float(np.mean(finite)) if finite else None
+
+
+def _null_columns(
+    real_record: Mapping[str, Any], null_lifetimes: Sequence[Sequence[float]], thresholds_hours: Sequence[float]
+) -> dict[str, Any]:
+    """stratum ``all`` 的 null 欄位：跨 seed 平均的 n／median／p90／frac，以及超額與比值。
+
+    ``excess = 真實 frac − null frac``；``ratio = 真實 frac ÷ null frac``（null frac 為 0 或
+    任一邊缺值時為 ``None``）。跨 seed 平均只納入該 seed 有未截尾 track 的統計。
+    """
+
+    summaries = [_lifetime_summary(values, thresholds_hours) for values in null_lifetimes]
+    columns: dict[str, Any] = {
+        "null_n_seeds": len(summaries),
+        "null_n_uncensored": _mean_or_none([float(item["n"]) for item in summaries]),
+        "null_median_lifetime_hours": _mean_or_none([item["median"] for item in summaries]),
+        "null_p90_lifetime_hours": _mean_or_none([item["p90"] for item in summaries]),
+    }
+    for hours in thresholds_hours:
+        name = lifetime_fraction_column(hours)
+        null_frac = _mean_or_none([item["frac"][name] for item in summaries])
+        real_frac = real_record.get(name)
+        columns[f"null_{name}"] = null_frac
+        columns[f"excess_{name}"] = (real_frac - null_frac) if (real_frac is not None and null_frac is not None) else None
+        columns[f"ratio_{name}"] = (
+            (real_frac / null_frac) if (real_frac is not None and null_frac is not None and null_frac > 0.0) else None
+        )
+    return columns
+
+
+# ---------------------------------------------------------------------------
 # Bootstrap、熱點與最終記錄組裝
 # ---------------------------------------------------------------------------
 
@@ -881,28 +1019,54 @@ SITE_STAT_FIELDNAMES = (
 )
 
 
-def site_stat_fieldnames(lifetime_thresholds_hours: Sequence[float] = LIFETIME_THRESHOLD_HOURS) -> list[str]:
-    """依壽命門檻設定產生 CSV 欄位；預設門檻等同 :data:`SITE_STAT_FIELDNAMES`。"""
+def site_stat_fieldnames(
+    lifetime_thresholds_hours: Sequence[float] = LIFETIME_THRESHOLD_HOURS,
+    *,
+    with_null: bool = False,
+    with_track_filter: bool = False,
+) -> list[str]:
+    """依壽命門檻設定產生 CSV 欄位；預設門檻等同 :data:`SITE_STAT_FIELDNAMES`。
+
+    ``with_track_filter`` 附加 ``track_core_filter_quantile``（track 只含各站前 q 強核心時）；
+    ``with_null`` 附加 :func:`null_column_names` 的 null／excess／ratio 欄位。兩者未啟用時欄位與
+    舊版完全相同。
+    """
 
     default_columns = [lifetime_fraction_column(hours) for hours in LIFETIME_THRESHOLD_HOURS]
     anchor = SITE_STAT_FIELDNAMES.index(default_columns[0])
     columns = [lifetime_fraction_column(hours) for hours in lifetime_thresholds_hours]
-    return [*SITE_STAT_FIELDNAMES[:anchor], *columns, *SITE_STAT_FIELDNAMES[anchor + len(default_columns) :]]
+    names = [*SITE_STAT_FIELDNAMES[:anchor], *columns, *SITE_STAT_FIELDNAMES[anchor + len(default_columns) :]]
+    if with_track_filter:
+        names.append("track_core_filter_quantile")
+    if with_null:
+        names.extend(null_column_names(lifetime_thresholds_hours))
+    return names
 
 
 def _write_site_statistics(
-    output_dir: Path, records: list[dict[str, Any]], lifetime_thresholds_hours: Sequence[float] = LIFETIME_THRESHOLD_HOURS
+    output_dir: Path,
+    records: list[dict[str, Any]],
+    lifetime_thresholds_hours: Sequence[float] = LIFETIME_THRESHOLD_HOURS,
+    *,
+    with_null: bool = False,
+    track_core_filter: Mapping[str, Any] | None = None,
 ) -> None:
     """寫出 long-format ``site_statistics.csv`` 與 ``site_statistics.json``。"""
 
     csv_path = output_dir / "site_statistics.csv"
     with csv_path.open("w", encoding="utf-8", newline="") as stream:
-        fieldnames = site_stat_fieldnames(lifetime_thresholds_hours)
+        fieldnames = site_stat_fieldnames(
+            lifetime_thresholds_hours, with_null=with_null, with_track_filter=track_core_filter is not None
+        )
         writer = csv.DictWriter(stream, fieldnames=fieldnames)
         writer.writeheader()
         for record in records:
             writer.writerow({key: record.get(key) for key in fieldnames})
-    _atomic_write_json(output_dir / "site_statistics.json", {"schema_version": AGGREGATE_SCHEMA_VERSION, "records": records})
+    payload: dict[str, Any] = {"schema_version": AGGREGATE_SCHEMA_VERSION, "records": records}
+    if track_core_filter is not None or with_null:
+        payload["track_core_filter"] = track_core_filter
+        payload["lifetime_scope_zh"] = lifetime_scope_text(track_core_filter)
+    _atomic_write_json(output_dir / "site_statistics.json", payload)
 
 
 def _finalize_spatial(shape: tuple[int, int], accumulator: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
@@ -1014,6 +1178,11 @@ def run_aggregate(args: argparse.Namespace) -> int:
     track_root = Path(args.track_root)
     detect_root = Path(args.detect_root)
     output_dir = Path(args.output_dir)
+    null_roots = [Path(item) for item in (getattr(args, "null_track_root", None) or [])]
+    _require(len({str(path.resolve()) for path in null_roots}) == len(null_roots), "--null-track-root 不可重複指定同一個目錄")
+    _require(
+        all(path.resolve() != track_root.resolve() for path in null_roots), "--null-track-root 不可與主要 --track-root 相同"
+    )
 
     present_domains = [domain_id for domain_id in all_domain_ids if (track_root / domain_id).is_dir()]
     missing_domains = [domain_id for domain_id in all_domain_ids if domain_id not in present_domains]
@@ -1081,6 +1250,7 @@ def run_aggregate(args: argparse.Namespace) -> int:
             "min_coverage": float(first_shard["min_coverage"]),
             "tracking_config": manifest.get("tracking_config"),
             "state_label": manifest.get("state_label"),
+            "track_core_filter": manifest.get("track_core_filter"),
         }
 
     shared = _validate_cross_domain_consistency(domain_context)
@@ -1094,6 +1264,31 @@ def run_aggregate(args: argparse.Namespace) -> int:
         grids[domain_id] = grid
         domain_masks[domain_id] = _build_domain_masks(domain_id, grid, design, study_design_path)
     site_mask = {site_id: mask for masks in domain_masks.values() for site_id, mask in masks.items()}
+
+    # --- 時間置換 null 對照組：驗證設定一致，並以與真實相同的規則取各站未截尾壽命 ---------------
+    null_runs: list[dict[str, Any]] = []
+    for null_root in null_roots:
+        seed_value: int | None = None
+        per_site_lifetimes: dict[str, list[float]] = {}
+        domain_records: dict[str, dict[str, str]] = {}
+        for domain_id in present_domains:
+            _require((null_root / domain_id).is_dir(), f"--null-track-root 缺少 domain {domain_id}: {null_root}")
+            null_loaded = _load_track_domain(null_root, domain_id, expect_null=True)
+            _validate_null_against_real(
+                {"manifest": domain_context[domain_id]["manifest"]}, null_loaded, domain_id=domain_id, null_root=null_root
+            )
+            domain_seed = int(null_loaded["manifest"]["null_model"]["seed"])
+            _require(seed_value is None or seed_value == domain_seed, f"{null_root} 各 domain 的 shuffle seed 不一致")
+            seed_value = domain_seed
+            per_site_lifetimes.update(_track_lifetimes_by_site(null_loaded, domain_masks[domain_id], grids[domain_id]))
+            manifest_path = null_root / domain_id / "manifest.json"
+            domain_records[domain_id] = {"manifest_path": str(manifest_path), "manifest_sha256": _sha256_file(manifest_path)}
+        assert seed_value is not None
+        null_runs.append({"root": null_root, "seed": seed_value, "lifetimes": per_site_lifetimes, "domains": domain_records})
+    null_seeds = [run["seed"] for run in null_runs]
+    _require(len(set(null_seeds)) == len(null_seeds), f"--null-track-root 的 shuffle seed 重複: {null_seeds}")
+    track_core_filter = shared["track_core_filter"]
+    scope_text = lifetime_scope_text(track_core_filter)
 
     # --- Pass 1：各站自己的強核心門檻 ------------------------------------------------
     site_thresholds = _compute_site_thresholds(detect_root, domain_context, domain_masks, grids, strong_quantile)
@@ -1166,7 +1361,7 @@ def run_aggregate(args: argparse.Namespace) -> int:
         colour_limits[site_id] = _compute_site_colour_limits(site_spatial[site_id]["all"])
 
         for stratum in ordered:
-            records.append(
+            record = (
                 _finalize_site_record(
                     site_id,
                     stratum,
@@ -1180,7 +1375,14 @@ def run_aggregate(args: argparse.Namespace) -> int:
                     lifetime_thresholds_hours=lifetime_thresholds,
                 )
             )
-    _write_site_statistics(output_dir, records, lifetime_thresholds)
+            if track_core_filter is not None:
+                record["track_core_filter_quantile"] = track_core_filter["quantile"]
+            if null_runs and stratum == "all":
+                record.update(
+                    _null_columns(record, [run["lifetimes"].get(site_id, []) for run in null_runs], lifetime_thresholds)
+                )
+            records.append(record)
+    _write_site_statistics(output_dir, records, lifetime_thresholds, with_null=bool(null_runs), track_core_filter=track_core_filter)
 
     # --- 逐站 spatial npz ------------------------------------------------------------
     for site_id in sites_present:
@@ -1240,6 +1442,9 @@ def run_aggregate(args: argparse.Namespace) -> int:
                 records={stratum: record_index[(site_id, stratum)] for stratum in ("all", *SEASONS) if (site_id, stratum) in record_index},
                 lifetimes_uncensored=list(all_accumulator["track_lifetimes"]),
                 lifetimes_all=list(all_accumulator["track_lifetimes_all"]),
+                null_lifetimes=[list(run["lifetimes"].get(site_id, [])) for run in null_runs],
+                lifetime_scope_text=scope_text,
+                lifetime_thresholds_hours=lifetime_thresholds,
                 evolution_mean_day=evolution_mean_day,
                 evolution_track_count=age_count,
                 day_stats={day: list(row) for day, row in all_accumulator["day_stats"].items()},
@@ -1291,6 +1496,17 @@ def run_aggregate(args: argparse.Namespace) -> int:
         "hotspot_min_cells_applies_to": "figures_only",
         "lifetime_thresholds_hours": lifetime_thresholds,
         "lifetime_evolution_min_hours": evolution_min_hours,
+        "track_core_filter": track_core_filter,
+        "lifetime_scope_zh": scope_text,
+        "null_inputs": [
+            {
+                "track_root": str(run["root"]),
+                "null_model": {"type": "time_shuffle", "seed": run["seed"]},
+                "seed": run["seed"],
+                "domains": run["domains"],
+            }
+            for run in null_runs
+        ],
         "strong_core_thresholds": {
             site_id: {
                 "strong_core_threshold_sinv": site_thresholds[site_id]["threshold_sinv"],
@@ -1366,6 +1582,12 @@ def register_subcommands(subparsers: argparse._SubParsersAction) -> None:
     aggregate.add_argument(
         "--lifetime-evolution-min-hours", type=float, default=LIFETIME_EVOLUTION_MIN_HOURS,
         help="吸引強度演化圖只納入壽命不小於此小時數的未截尾軌跡，預設 12",
+    )
+    aggregate.add_argument(
+        "--null-track-root", type=Path, nargs="+", default=None, metavar="DIR",
+        help="時間置換對照組的 track 根目錄（可多個，每個含 <domain>/ 子目錄，由 track-period --shuffle-seed 產生）；"
+        "必須與主要 track-root 同 detection／tracking 設定與 track_core_filter（僅 seed 不同），否則拒絕。"
+        "site_statistics 加上 null_／excess_／ratio_ 欄位，壽命圖疊上 null CCDF",
     )
     aggregate.add_argument("--bootstrap-reps", type=int, default=1_000)
     aggregate.add_argument("--seed", type=int, default=20_260_928)

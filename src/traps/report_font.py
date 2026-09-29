@@ -109,6 +109,15 @@ FIGURE_TEXT: Final[Mapping[str, str]] = MappingProxyType(
         "date": "日期",
         "no_data": "無足夠資料",
         "strong_threshold": "強核心門檻",
+        "null_ccdf_legend": "隨機時間序對照",
+        "null_band_legend": "跨 seed 最小–最大",
+        "excess": "超額",
+        "real_short": "真實",
+        "null_short": "對照",
+        "lifetime_refers_to": "壽命對象",
+        "strong_core_structures": "強核心結構",
+        "all_qualified_structures": "全部合格結構",
+        "per_site_top": "各站前",
     }
 )
 

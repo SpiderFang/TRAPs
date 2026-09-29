@@ -43,7 +43,7 @@ TRAPs 在 SERVER 上的所有程式碼、輸入、輸出都放在
 | `$TRAPS_REPO`（`.../traps-repo`） | git clone（`main` 分支）+ `.venv` |
 | `$TRAPS_INPUTS`（`.../traps-inputs`） | `study_design` 快照、海岸線 GeoJSON、ocean mask sidecar（`ocean_masks/<domain>/`） |
 | `$TRAPS_LOCAL_DATA`（`.../traps-local-data`） | 本機端 OCM 表層流場複本，`ocm_surface/<domain>/{grid, months/<YYYYMM>}`，加上 `.staged/<domain>.done` 標記檔 |
-| `$TRAPS_RUNS`（`.../traps-runs`） | 所有跑批結果：`runs/<param_id>/{detect,track,aggregate,logs}`、共用快取（`cache/{uv,uv-python,mpl,xdg}`）、`bin/uv`、`.lock` |
+| `$TRAPS_RUNS`（`.../traps-runs`） | 所有跑批結果：`runs/<param_id>/{detect,track,track_null_s<seed>,aggregate,logs}`（`TRAPS_TRACK_SUBDIR`／`TRAPS_AGGREGATE_SUBDIR` 可改名）、共用快取（`cache/{uv,uv-python,mpl,xdg}`）、`bin/uv`、`.lock` |
 | `$TRAPS_WORKSPACE/deploy-bundles` | 從 Mac 端帶上來的 git bundle 檔案 |
 
 `SETUP` 模式會建立以上 `traps-*` 目錄並設成 `chmod 700`；`deploy-bundles` 與
@@ -271,6 +271,36 @@ $VENV_PY -m traps track-period \
 
 log 在 `$TRAPS_RUNS/runs/$TRAPS_PARAM_ID/logs/track/<domain>.log`。預估耗時：
 每個 domain 數十分鐘量級，實際隨資料量變動。
+
+#### TRACK 變體：強核心篩選與參數覆寫
+
+追蹤全部合格核心的壽命大多可由隨機串接解釋（見 README「只追蹤各站最強核心」），建議改用強核心變體並
+搭配 null 對照。以下環境變數皆可省略，全部未設定時行為與舊版完全相同：
+
+| 變數 | 作用 |
+|---|---|
+| `TRAPS_TRACK_STRONG_QUANTILE` | 有值時 TRACK／TRACKNULL 加 `--track-strong-quantile <q>`（例如 `0.10`） |
+| `TRAPS_TRACK_CORE_M`／`TRAPS_TRACK_CURVE_M` | 有值時覆寫追蹤門檻（hourly 與 daily25h 都適用）；未設時 daily25h 為 10000／20000，hourly 為 track-period 預設 |
+| `TRAPS_TRACK_SUBDIR`（預設 `track`） | 追蹤輸出子目錄 `runs/<param_id>/<subdir>`，新變體可寫在舊結果旁而不覆寫；AGGREGATE 讀同一個子目錄 |
+| `TRAPS_AGGREGATE_SUBDIR`（預設 `aggregate`） | AGGREGATE 輸出子目錄 |
+| `TRAPS_NULL_SEEDS`（預設 `"1 2"`） | TRACKNULL 的 shuffle seed 清單 |
+
+### TRACKNULL
+
+時間置換對照組，DETECT 全部成功後即可與 TRACK 分開跑：
+
+```bash
+TRAPS_TRACK_STRONG_QUANTILE=0.10 TRAPS_TRACK_SUBDIR=track_strong scripts/run_traps_server.sh TRACK
+TRAPS_TRACK_STRONG_QUANTILE=0.10 TRAPS_TRACK_SUBDIR=track_strong TRAPS_NULL_SEEDS="1 2" \
+  scripts/run_traps_server.sh TRACKNULL
+TRAPS_TRACK_SUBDIR=track_strong TRAPS_AGGREGATE_SUBDIR=aggregate_strong scripts/run_traps_server.sh AGGREGATE
+```
+
+TRACKNULL 對每個 seed × domain（全部同時平行）呼叫與 TRACK 完全相同旗標的
+`track-period --shuffle-seed <seed>`，輸出到 `runs/<param_id>/<subdir>_null_s<seed>/<domain>`
+（預設 subdir 即 `track_null_s<seed>`），log 在 `logs/<subdir>_null/`。AGGREGATE 會自動把
+`<subdir>_null_s*` 中「每個 domain 都有 `_SUCCESS`」的目錄以 `--null-track-root` 帶入（未完成者略過並記 log；
+`TRAPS_AGGREGATE_ARGS` 已含 `--null-track-root` 時不重複帶入）。
 
 ### AGGREGATE
 

@@ -168,6 +168,29 @@ python scripts/null_test_tracking.py --output-dir "$OUT" \
 輸出 `comparison.csv`（含 `coherence_ratio` ＝ 真實 frac(壽命≥3 步) ÷ 置換平均）與逐
 domain 壽命 CCDF 的 `comparison.png`；比值接近 1 代表 track 壽命與隨機串接無異。
 
+#### 只追蹤各站最強核心（`--track-strong-quantile`）與 null 對照（`--null-track-root`）
+
+時間置換檢驗顯示：追蹤**全部**合格核心（每 snapshot 約 15 個／1000 km²）並使用 10 km／20 km
+門檻時，壽命多半可由隨機串接解釋（置換 p90 約 10 天、真實約 13 天）。因此壽命改為只追蹤各站最強核心，
+並一律對照 null 報告：
+
+* `track-period --track-strong-quantile Q`（預設不設＝追蹤全部合格核心，行為不變）：Pass 1 只讀欄位，
+  以 `sites.site_masks` 依核心格點（`core_row`, `core_col`）分站，母體＝canonical 且 `coverage_pass` 快照的
+  合格核心；各站門檻＝該站核心 s1 的 Q 分位數（越負越強）。Pass 2 只讓 `core_s1 <=` 所屬站門檻的合格
+  detection 進入 tracker，站外核心一律丟棄。門檻取自**真實** canonical 集合，與 `--shuffle-seed` 併用時真實與
+  null 相同。逐站門檻（s⁻¹、day⁻¹）、Q、各站保留數、丟棄數記於 manifest 與 `tracking_summary.json` 的
+  `track_core_filter`，且與 `aggregate --strong-quantile Q` 的逐站強核心門檻同一母體、位元相同。
+* `aggregate --null-track-root DIR [DIR ...]`：每個 DIR 是 `track-period --shuffle-seed` 的 track 根目錄
+  （含 `<domain>/`），必須與真實 track-root 同 detection／tracking 設定與 `track_core_filter`（僅 seed 不同），
+  否則拒絕；主要 `--track-root` 仍不可是 null。stratum `all` 的 `site_statistics` 增加 `null_n_seeds`、
+  `null_n_uncensored`、`null_median_lifetime_hours`、`null_p90_lifetime_hours`、`null_track_frac_uncensored_ge_<N>h`
+  （跨 seed 平均）、`excess_track_frac_uncensored_ge_<N>h`（真實比例 − null 比例）與
+  `ratio_track_frac_uncensored_ge_<N>h`（真實 ÷ null，null 為 0 時空白）；其他 stratum 為空。壽命圖在真實未截尾
+  CCDF 上疊虛線灰色 null CCDF（跨 seed 平均，最小–最大帶）並標註各門檻的超額。manifest 記錄
+  `null_inputs`（路徑、seed、各 domain manifest 的 sha256）、`track_core_filter` 與 `lifetime_scope_zh`。
+  track 經強核心篩選時，圖表與 `site_statistics.json` 註明壽命指「強核心結構（各站前 Q%）」。
+* `scripts/null_test_tracking.py` 的 CSV 增加 `core_filter_q`，標籤含分位數，且只與同 (domain, 門檻, q) 配對。
+
 前兩階段輸出的欄位命名與陣列 schema 是為 `aggregate` 保留的完整證據鏈；`aggregate`
 讀入所有 4 個 domain 的 `track-period` 輸出（`--allow-partial-domains` 可放寬為部分
 domain，缺席站點會明列於 manifest），核對四區共用同一組 `param_id`、

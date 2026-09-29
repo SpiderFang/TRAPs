@@ -71,6 +71,10 @@ class SiteFigureData:
     """壽命 CCDF 圖上標示的門檻（小時）。"""
     lifetime_evolution_min_hours: float = 12.0
     """吸引強度演化面板納入的未截尾軌跡最短壽命（小時）。"""
+    null_lifetimes: Sequence[Sequence[float]] = ()
+    """時間置換對照組：每個 seed 一組該站未截尾壽命（小時）；空序列表示沒有對照組。"""
+    lifetime_scope_text: str = ""
+    """壽命統計對象說明（例如「強核心結構（各站前 10%）」）；空字串表示不註明。"""
 
 
 def _load_matplotlib() -> tuple[Any, Any]:
@@ -123,6 +127,24 @@ def _ccdf(values: Sequence[float]) -> tuple[np.ndarray, np.ndarray]:
     n = sorted_values.size
     survival = 1.0 - (np.arange(1, n + 1) - 1) / n
     return sorted_values, survival
+
+
+def null_ccdf_band(
+    null_lifetimes: Sequence[Sequence[float]], extra_values: Sequence[float] = ()
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """各 seed 的 CCDF P(X >= x) 在共同 x 格點上的（x、跨 seed 平均、最小、最大）。
+
+    共同格點為所有 seed（及 ``extra_values``）壽命值的聯集；沒有未截尾壽命的 seed 不納入。
+    沒有任何有效 seed 時回傳四個空陣列。
+    """
+
+    arrays = [np.sort(np.asarray(values, dtype=np.float64)) for values in null_lifetimes if len(values)]
+    if not arrays:
+        empty = np.zeros(0)
+        return empty, empty, empty, empty
+    grid = np.unique(np.concatenate([*arrays, np.asarray(extra_values, dtype=np.float64)]))
+    survival = np.stack([1.0 - np.searchsorted(values, grid, side="left") / values.size for values in arrays], axis=0)
+    return grid, survival.mean(axis=0), survival.min(axis=0), survival.max(axis=0)
 
 
 def running_mean_with_gaps(values: np.ndarray, window: int = RUNNING_MEAN_DAYS, min_fraction: float = 0.5) -> np.ndarray:
@@ -516,21 +538,43 @@ def render_lifetime(output_path: Path, data: SiteFigureData, *, footer: str, dpi
         left.step(x_u, y_u, where="post", color="#1b4965", linestyle="-", label=f"{T['uncensored']} (n={x_u.size})")
     if x_a.size:
         left.step(x_a, y_a, where="post", color="#1b4965", linestyle="--", alpha=0.7, label=f"{T['all_tracks']} (n={x_a.size})")
-    if x_u.size or x_a.size:
+    grid, null_mean, null_low, null_high = null_ccdf_band(data.null_lifetimes, x_u)
+    has_null = grid.size > 0
+    if has_null:
+        n_seeds = sum(1 for values in data.null_lifetimes if len(values))
+        positive = null_high[null_high > 0]
+        floor = 0.5 * float(positive.min()) if positive.size else 1.0e-3
+        left.fill_between(
+            grid, np.maximum(null_low, floor), np.maximum(null_high, floor), step="post", color="#adb5bd", alpha=0.35, linewidth=0,
+            label=T["null_band_legend"],
+        )
+        left.step(
+            grid, np.where(null_mean > 0, null_mean, np.nan), where="post", color="#6c757d", linestyle="--", linewidth=1.6,
+            label=f"{T['null_ccdf_legend']}（{n_seeds} seeds）",
+        )
+    if x_u.size or x_a.size or has_null:
         left.set_yscale("log")
         left.legend(fontsize=8)
     else:
         left.text(0.5, 0.5, T["no_data"], ha="center", va="center", transform=left.transAxes)
     if x_u.size or x_a.size:
+        all_record = data.records.get("all") or {}
         for threshold in data.lifetime_thresholds_hours:
+            label = f"{_hours_label(threshold)} h"
+            excess = all_record.get(f"excess_track_frac_uncensored_ge_{_hours_label(threshold)}h") if has_null else None
+            if excess is not None:
+                label += f"  {T['excess']} {float(excess):+.2f}"
             left.axvline(float(threshold), color="#6c757d", linestyle=":", linewidth=1.0, zorder=1)
             left.text(
-                float(threshold), 0.98, f"{_hours_label(threshold)} h", transform=left.get_xaxis_transform(), rotation=90, ha="right",
+                float(threshold), 0.98, label, transform=left.get_xaxis_transform(), rotation=90, ha="right",
                 va="top", fontsize=7, color="#495057",
             )
     left.set_xlabel(T["lifetime_hours"])
     left.set_ylabel(T["ccdf_ylabel"])
-    left.set_title(T["ccdf_title"], fontsize=10)
+    left.set_title(
+        f"{T['ccdf_title']}\n{T['lifetime_refers_to']}：{data.lifetime_scope_text}" if data.lifetime_scope_text else T["ccdf_title"],
+        fontsize=10,
+    )
     left.grid(alpha=0.25)
 
     age = np.linspace(0.0, 1.0, len(data.evolution_mean_day)) if len(data.evolution_mean_day) else np.zeros(0)

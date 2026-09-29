@@ -46,6 +46,7 @@ from .cli import (
 from .detection import detect_snapshot
 from .metrics import _grid_axes
 from .models import DetectionConfig, TrapDetection
+from .sites import load_study_design, site_masks
 from .tracking import (
     StreamingTracker,
     TrackingConfig,
@@ -794,17 +795,163 @@ def _compute_gaps(canonical_time: np.ndarray, nominal_step_ns: int) -> dict[str,
     }
 
 
+SECONDS_PER_DAY = 86_400.0
+
+
+# ---------------------------------------------------------------------------
+# 強核心篩選（--track-strong-quantile）：逐站門檻，與 aggregate 共用同一組母體定義
+# ---------------------------------------------------------------------------
+
+
+def _canonical_valid_snapshot_indices_by_month(canonical: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """回傳每個月份下，canonical 且 coverage_pass 的 snapshot_index 陣列（排序）。"""
+
+    month_codes = canonical["month"]
+    snapshot_index = canonical["snapshot_index"]
+    coverage_pass = canonical["coverage_pass"]
+    result: dict[str, np.ndarray] = {}
+    for month_code in np.unique(month_codes):
+        month = f"{int(month_code):06d}"
+        rows = (month_codes == month_code) & coverage_pass
+        result[month] = np.sort(snapshot_index[rows])
+    return result
+
+
+def _site_core_s1_for_month(
+    shard_dir: Path,
+    valid_snapshot_indices: np.ndarray,
+    flat_site_masks: Mapping[str, np.ndarray],
+    nx: int,
+) -> dict[str, np.ndarray]:
+    """只讀 ``detections.npz`` 的少數欄位，回傳該月份各站分析區內、合格且 canonical valid 的核心 s1。
+
+    這是「強核心母體」的唯一定義（合格核心 × canonical 且 coverage_pass 的快照 × 核心格點
+    落在該站分析區遮罩內），``track-period --track-strong-quantile`` 與 ``aggregate`` 的
+    強核心門檻都呼叫它，因此兩者的門檻必然一致。
+    """
+
+    if valid_snapshot_indices.size == 0:
+        return {site_id: np.zeros(0, dtype=np.float64) for site_id in flat_site_masks}
+    with np.load(shard_dir / "detections.npz") as archive:
+        snapshot_index = np.array(archive["snapshot_index"])
+        is_qualified = np.array(archive["is_qualified"])
+        core_row = np.array(archive["core_row"])
+        core_col = np.array(archive["core_col"])
+        core_s1 = np.array(archive["core_s1_sinv"])
+    selected = is_qualified & np.isin(snapshot_index, valid_snapshot_indices)
+    flat = core_row.astype(np.int64) * np.int64(nx) + core_col.astype(np.int64)
+    return {site_id: core_s1[selected & mask_flat[flat]] for site_id, mask_flat in flat_site_masks.items()}
+
+
+def _thresholds_from_core_values(core_s1_by_site: Mapping[str, np.ndarray], strong_quantile: float) -> dict[str, dict[str, Any]]:
+    """各站獨立以自己的核心 s1 計算強核心門檻（s⁻¹ 與 day⁻¹）；站與站之間完全不 pooled。
+
+    ``s1`` 越負代表吸引越強，因此門檻是該站核心 s1 的 ``strong_quantile`` 分位數，
+    強核心定義為 ``s1 <= 門檻``。站內沒有合格核心時門檻為 ``None``。
+    """
+
+    thresholds: dict[str, dict[str, Any]] = {}
+    for site_id, values in core_s1_by_site.items():
+        finite = np.asarray(values, dtype=np.float64)
+        finite = finite[np.isfinite(finite)]
+        if finite.size == 0:
+            thresholds[site_id] = {"threshold_sinv": None, "threshold_day": None, "core_count": 0}
+            continue
+        threshold_sinv = float(np.quantile(finite, strong_quantile))
+        thresholds[site_id] = {
+            "threshold_sinv": threshold_sinv,
+            "threshold_day": threshold_sinv * SECONDS_PER_DAY,
+            "core_count": int(finite.size),
+        }
+    return thresholds
+
+
+def _domain_site_masks(domain_id: str, grid: Mapping[str, Any], study_design_path: Path) -> dict[str, np.ndarray]:
+    """建立一個 domain 內各研究站的分析區遮罩（與 ``aggregate._build_domain_masks`` 相同的定義）。"""
+
+    design = load_study_design(study_design_path)
+    ocean_mask = np.asarray(grid["analysis_ocean_mask"], dtype=bool)
+    partition = site_masks(domain_id, grid["lon"], grid["lat"], ocean_mask, study_design_path=study_design_path)
+    domain_site_ids = [str(site["study_site_id"]) for site in design["study_sites"] if site["flow_domain_id"] == domain_id]
+    return {site_id: partition[site_id] for site_id in domain_site_ids}
+
+
+def _compute_track_core_thresholds(
+    shard_dirs: Mapping[str, Path],
+    canonical: Mapping[str, np.ndarray],
+    site_masks_2d: Mapping[str, np.ndarray],
+    strong_quantile: float,
+) -> dict[str, dict[str, Any]]:
+    """Pass 1（只讀欄位、不重建曲線）：各站強核心門檻，母體由真實 canonical 集合決定。"""
+
+    ny, nx = next(iter(site_masks_2d.values())).shape
+    del ny
+    flat_masks = {site_id: mask.reshape(-1) for site_id, mask in site_masks_2d.items()}
+    collected: dict[str, list[np.ndarray]] = {site_id: [] for site_id in flat_masks}
+    for month, valid_indices in sorted(_canonical_valid_snapshot_indices_by_month(canonical).items()):
+        per_site = _site_core_s1_for_month(shard_dirs[month], valid_indices, flat_masks, int(nx))
+        for site_id, values in per_site.items():
+            collected[site_id].append(values)
+    core_s1_by_site = {
+        site_id: (np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float64)) for site_id, chunks in collected.items()
+    }
+    return _thresholds_from_core_values(core_s1_by_site, strong_quantile)
+
+
+class _StrongCoreFilter:
+    """Pass 2 的逐 detection 篩選器：保留核心 s1 不高於「核心所在站」門檻的合格 detection。
+
+    以攤平格點索引查表；不在任何站遮罩內的核心格點（門檻 NaN）一律丟棄。累計各站保留
+    與站外丟棄的數量，供 manifest 與 ``tracking_summary.json`` 記錄。
+    """
+
+    def __init__(self, site_masks_2d: Mapping[str, np.ndarray], thresholds: Mapping[str, Mapping[str, Any]]) -> None:
+        first = next(iter(site_masks_2d.values()))
+        self.nx = int(first.shape[1])
+        self.site_ids = list(site_masks_2d)
+        self.threshold_flat = np.full(int(first.size), np.nan, dtype=np.float64)
+        self.site_index_flat = np.full(int(first.size), -1, dtype=np.int64)
+        for index, site_id in enumerate(self.site_ids):
+            mask_flat = site_masks_2d[site_id].reshape(-1)
+            self.site_index_flat[mask_flat] = index
+            value = thresholds[site_id]["threshold_sinv"]
+            self.threshold_flat[mask_flat] = np.nan if value is None else float(value)
+        self.kept_by_site = {site_id: 0 for site_id in self.site_ids}
+        self.qualified_seen = 0
+        self.dropped_weak = 0
+        self.dropped_outside_sites = 0
+
+    def keep_mask(self, core_row: np.ndarray, core_col: np.ndarray, core_s1: np.ndarray) -> np.ndarray:
+        """回傳與輸入等長的布林陣列，並累計統計。"""
+
+        flat = np.asarray(core_row, dtype=np.int64) * np.int64(self.nx) + np.asarray(core_col, dtype=np.int64)
+        site_index = self.site_index_flat[flat]
+        keep = np.asarray(core_s1, dtype=np.float64) <= self.threshold_flat[flat]  # NaN 門檻 -> False
+        self.qualified_seen += int(flat.size)
+        self.dropped_outside_sites += int(np.count_nonzero(site_index < 0))
+        self.dropped_weak += int(np.count_nonzero((site_index >= 0) & ~keep))
+        for index, site_id in enumerate(self.site_ids):
+            self.kept_by_site[site_id] += int(np.count_nonzero(keep & (site_index == index)))
+        return keep
+
+
 def _rebuild_qualified_detections(
-    detections: Mapping[str, np.ndarray], snapshot_index: int
+    detections: Mapping[str, np.ndarray], snapshot_index: int, core_filter: "_StrongCoreFilter | None" = None
 ) -> list[tuple[int, TrapDetection]]:
     """從 detections.npz 陣列重建某個 snapshot 內所有合格 ``TrapDetection``。
 
     回傳 ``(detection_index, TrapDetection)`` list；只重建 ``is_qualified`` 為真的列，
     因為 :class:`~traps.tracking.StreamingTracker` 在 ``require_qualified=True`` 下只會
-    使用合格觀測，重建未合格曲線只是白白複製陣列。
+    使用合格觀測，重建未合格曲線只是白白複製陣列。給定 ``core_filter`` 時，只重建通過
+    強核心篩選的合格列（不通過者不會進入 tracker）。
     """
 
-    rows = np.nonzero(detections["snapshot_index"] == snapshot_index)[0]
+    rows = np.nonzero((detections["snapshot_index"] == snapshot_index) & detections["is_qualified"])[0]
+    if core_filter is not None and rows.size:
+        keep = core_filter.keep_mask(
+            detections["core_row"][rows], detections["core_col"][rows], detections["core_s1_sinv"][rows]
+        )
+        rows = rows[keep]
     result: list[tuple[int, TrapDetection]] = []
     for row in rows.tolist():
         if not bool(detections["is_qualified"][row]):
@@ -913,6 +1060,23 @@ def run_track_period(args: argparse.Namespace) -> int:
     )
     tracker = StreamingTracker(tracking_config)
 
+    # 強核心篩選（--track-strong-quantile）：Pass 1 只讀欄位，由「真實 canonical 集合」決定各站門檻；
+    # 之後真實與 null（--shuffle-seed）兩種執行共用同一組門檻，Pass 2 在推入 tracker 前篩選。
+    strong_quantile = getattr(args, "track_strong_quantile", None)
+    core_filter: _StrongCoreFilter | None = None
+    core_filter_thresholds: dict[str, dict[str, Any]] | None = None
+    core_filter_design_path: Path | None = None
+    if strong_quantile is not None:
+        strong_quantile = float(strong_quantile)
+        _require(0.0 < strong_quantile < 1.0, "--track-strong-quantile 必須介於 0 與 1 之間（不含端點）")
+        core_filter_design_path = Path(getattr(args, "study_design", None) or DEFAULT_STUDY_DESIGN_PATH)
+        with np.load(shard_dirs[available_months[0]] / "grid_reference.npz") as archive:
+            grid_reference = {name: np.array(archive[name]) for name in archive.files}
+        filter_site_masks = _domain_site_masks(domain_id, grid_reference, core_filter_design_path)
+        _require(bool(filter_site_masks), f"研究設計中 {domain_id} 沒有任何研究站，無法套用 --track-strong-quantile")
+        core_filter_thresholds = _compute_track_core_thresholds(shard_dirs, canonical, filter_site_masks, strong_quantile)
+        core_filter = _StrongCoreFilter(filter_site_masks, core_filter_thresholds)
+
     # null model：保留 canonical 時間軸與 availability，僅把可用槽位的偵測結果換成
     # 隨機置換後的另一個可用 snapshot 的偵測（detection_keys 仍指向真實來源 snapshot）。
     shuffle_seed = getattr(args, "shuffle_seed", None)
@@ -969,7 +1133,7 @@ def run_track_period(args: argparse.Namespace) -> int:
                     with np.load(shard_dirs[src_month] / "detections.npz") as archive:
                         detections_cache[src_month] = {name: np.array(archive[name]) for name in archive.files}
                 src_detections = detections_cache[src_month]
-            qualified = _rebuild_qualified_detections(src_detections, src_snapshot)
+            qualified = _rebuild_qualified_detections(src_detections, src_snapshot, core_filter)
             frame_detections = tuple(detection for _, detection in qualified)
             detection_keys = tuple((src_month, src_snapshot, detection_index) for detection_index, _ in qualified)
             frame = TrackingFrame(time_utc_ns=time_utc_ns, detections=frame_detections, available=True)
@@ -1079,6 +1243,29 @@ def run_track_period(args: argparse.Namespace) -> int:
     def _quantile_or_none(values: list[float], q: float) -> float | None:
         return float(np.quantile(np.asarray(values, dtype=np.float64), q)) if values else None
 
+    track_core_filter: dict[str, Any] | None = None
+    if core_filter is not None and core_filter_thresholds is not None and strong_quantile is not None:
+        assert core_filter_design_path is not None
+        track_core_filter = {
+            "type": "site_strong_core_quantile",
+            "quantile": strong_quantile,
+            "population": "qualified cores of canonical coverage_pass snapshots with core cell inside the site mask",
+            "study_design_path": str(core_filter_design_path),
+            "study_design_sha256": _sha256_file(core_filter_design_path),
+            "thresholds": {
+                site_id: {
+                    "threshold_sinv": info["threshold_sinv"],
+                    "threshold_day": info["threshold_day"],
+                    "qualified_core_count": info["core_count"],
+                    "kept_core_count": core_filter.kept_by_site[site_id],
+                }
+                for site_id, info in core_filter_thresholds.items()
+            },
+            "qualified_detections_seen": core_filter.qualified_seen,
+            "dropped_weak": core_filter.dropped_weak,
+            "dropped_outside_sites": core_filter.dropped_outside_sites,
+        }
+
     tracking_summary = {
         "track_count": len(track_rows),
         "termination_reason_counts": termination_counts,
@@ -1092,6 +1279,7 @@ def run_track_period(args: argparse.Namespace) -> int:
             "p90": _quantile_or_none(uncensored_lifetimes, 0.90),
         },
         "null_model": null_model,
+        "track_core_filter": track_core_filter,
     }
     _atomic_write_json(output_dir / "tracking_summary.json", tracking_summary)
 
@@ -1126,6 +1314,7 @@ def run_track_period(args: argparse.Namespace) -> int:
         "state_label": state_label,
         "tracking_config": tracking_config.to_manifest_dict(),
         "null_model": null_model,
+        "track_core_filter": track_core_filter,
         "nominal_time_step_hours": float(args.nominal_time_step_hours),
         "requested_months": requested_months,
         "available_months": available_months,
@@ -1213,6 +1402,15 @@ def register_subcommands(subparsers: argparse._SubParsersAction) -> None:
         default=None,
         help="null model：以此種子置換可用 snapshot 的偵測（保留時間軸與缺口），破壞時間連續性；輸出不得餵給 aggregate",
     )
+    track_period.add_argument(
+        "--track-strong-quantile",
+        type=float,
+        default=None,
+        metavar="Q",
+        help="只追蹤各站最強的核心：站內合格核心 s1 的 Q 分位數（0<Q<1，例如 0.10）為門檻，s1 <= 門檻才進入 tracker；"
+        "預設不篩選（追蹤全部合格核心）。門檻取自真實 canonical 集合，與 --shuffle-seed 併用時真實與 null 相同",
+    )
+    track_period.add_argument("--study-design", type=Path, default=DEFAULT_STUDY_DESIGN_PATH, help="研究設計 JSON（--track-strong-quantile 用來切站）")
     track_period.set_defaults(handler=run_track_period)
 
     # Stage 3（跨月份／跨區彙整）在獨立模組 aggregate.py 實作；這裡只新增掛載，

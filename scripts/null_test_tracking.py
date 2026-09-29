@@ -6,6 +6,9 @@
 「coherence ratio」＝ 真實 fraction(壽命 >= 3 步) / 置換組（跨 seed）平均 fraction(>= 3 步)。
 比值明顯大於 1 才表示 track 具備超越隨機串接的時間連續性。
 
+若 track 以 ``--track-strong-quantile`` 產生，CSV 的 ``core_filter_q`` 與圖例都會標示該分位數，
+且只與相同 (domain, 門檻, q) 的置換組配對。
+
 圖中僅使用英文標籤與預設 sans 字型，避免 CJK 字型相依。
 """
 
@@ -26,7 +29,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 
 CSV_FIELDS = (
-    "run", "domain", "gate_core_m", "gate_curve_m", "shuffled", "seed", "n_tracks", "n_uncensored",
+    "run", "domain", "gate_core_m", "gate_curve_m", "core_filter_q", "shuffled", "seed", "n_tracks", "n_uncensored",
     "frac_lifetime_1", "median_steps", "p90_steps", "frac_ge3", "frac_ge7", "mean_steps", "coherence_ratio",
 )
 
@@ -54,6 +57,8 @@ def load_run(label: str, root: Path) -> list[dict[str, Any]]:
         manifest = _read_json(domain_dir / "manifest.json")
         cfg = manifest["tracking_config"]
         null = manifest.get("null_model")
+        core_filter = manifest.get("track_core_filter")
+        core_filter_q = "" if not core_filter else float(core_filter["quantile"])
         steps = _steps_from_hist(hist)
         n = int(steps.size)
 
@@ -66,6 +71,7 @@ def load_run(label: str, root: Path) -> list[dict[str, Any]]:
                 "domain": domain_dir.name,
                 "gate_core_m": float(cfg["max_core_distance_m"]),
                 "gate_curve_m": float(cfg["max_curve_distance_m"]),
+                "core_filter_q": core_filter_q,
                 "shuffled": null is not None,
                 "seed": "" if null is None else int(null["seed"]),
                 "n_tracks": int(summary["track_count"]),
@@ -85,16 +91,22 @@ def load_run(label: str, root: Path) -> list[dict[str, Any]]:
     return records
 
 
-def add_coherence_ratio(records: list[dict[str, Any]]) -> dict[tuple[str, float, float], float]:
-    """對每個 (domain, gate) 計算真實 / 置換平均的 fraction(>=3 步)，填入真實列。"""
+def _run_key(r: dict[str, Any]) -> tuple[str, float, float, Any]:
+    """真實與置換配對用的鍵：domain、兩個追蹤門檻與 track_core_filter 分位數（無篩選為空字串）。"""
 
-    shuffled: dict[tuple[str, float, float], list[float]] = defaultdict(list)
+    return (r["domain"], r["gate_core_m"], r["gate_curve_m"], r["core_filter_q"])
+
+
+def add_coherence_ratio(records: list[dict[str, Any]]) -> dict[tuple[str, float, float, Any], float]:
+    """對每個 (domain, gate, core_filter_q) 計算真實 / 置換平均的 fraction(>=3 步)，填入真實列。"""
+
+    shuffled: dict[tuple[str, float, float, Any], list[float]] = defaultdict(list)
     for r in records:
         if r["shuffled"]:
-            shuffled[(r["domain"], r["gate_core_m"], r["gate_curve_m"])].append(r["frac_ge3"])
-    ratios: dict[tuple[str, float, float], float] = {}
+            shuffled[_run_key(r)].append(r["frac_ge3"])
+    ratios: dict[tuple[str, float, float, Any], float] = {}
     for r in records:
-        key = (r["domain"], r["gate_core_m"], r["gate_curve_m"])
+        key = _run_key(r)
         if r["shuffled"] or key not in shuffled:
             continue
         null_mean = float(np.nanmean(shuffled[key]))
@@ -106,7 +118,7 @@ def add_coherence_ratio(records: list[dict[str, Any]]) -> dict[tuple[str, float,
 
 def plot_ccdf(records: list[dict[str, Any]], path: Path) -> None:
     domains = sorted({r["domain"] for r in records})
-    gates = sorted({(r["gate_core_m"], r["gate_curve_m"]) for r in records})
+    gates = sorted({(r["gate_core_m"], r["gate_curve_m"], r["core_filter_q"]) for r in records}, key=str)
     colors = {g: plt.get_cmap("tab10")(i % 10) for i, g in enumerate(gates)}
     with plt.rc_context({"font.family": "sans-serif", "font.sans-serif": ["DejaVu Sans"]}):
         fig, axes = plt.subplots(1, len(domains), figsize=(4.6 * len(domains), 3.8), squeeze=False, sharey=True)
@@ -115,11 +127,12 @@ def plot_ccdf(records: list[dict[str, Any]], path: Path) -> None:
                 steps = np.sort(r["_steps"])
                 ks = np.arange(1, int(steps[-1]) + 1)
                 ccdf = np.array([(steps >= k).mean() for k in ks])
-                gate = (r["gate_core_m"], r["gate_curve_m"])
+                gate = (r["gate_core_m"], r["gate_curve_m"], r["core_filter_q"])
+                q_label = f", top {r['core_filter_q']:.0%}/site" if r["core_filter_q"] != "" else ""
                 ax.step(
                     ks, ccdf, where="post", color=colors[gate], linestyle="--" if r["shuffled"] else "-",
                     label=f"{r['run']} ({'shuffled' if r['shuffled'] else 'real'}, "
-                    f"{r['gate_core_m']:g}/{r['gate_curve_m']:g} m)",
+                    f"{r['gate_core_m']:g}/{r['gate_curve_m']:g} m{q_label})",
                 )
             ax.set_yscale("log")
             ax.set_xlabel("lifetime (nominal steps)")
@@ -154,8 +167,9 @@ def main(argv: list[str] | None = None) -> int:
     plot_ccdf(records, args.output_dir / "comparison.png")
 
     if ratios:
-        for (domain, core, curve), ratio in sorted(ratios.items()):
-            print(f"coherence ratio {domain} gate {core:g}/{curve:g} m: {ratio:.3f}  (frac>=3 real / shuffled mean)")
+        for (domain, core, curve, q), ratio in sorted(ratios.items(), key=str):
+            q_text = f" strong-core q={q:g}" if q != "" else " all cores"
+            print(f"coherence ratio {domain} gate {core:g}/{curve:g} m{q_text}: {ratio:.3f}  (frac>=3 real / shuffled mean)")
     else:
         print("no shuffled runs given: coherence ratio not computed", file=sys.stderr)
     return 0

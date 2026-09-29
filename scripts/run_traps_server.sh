@@ -4,10 +4,14 @@
 # 用法：
 #   scripts/run_traps_server.sh <MODE>
 # MODE 為下列其中之一（大小寫需相符）：
-#   SETUP | PREPARE | STAGE | MASKS | DAILY | DETECT | TRACK | AGGREGATE | STATUS
+#   SETUP | PREPARE | STAGE | MASKS | DAILY | DETECT | TRACK | TRACKNULL | AGGREGATE | STATUS
 #
 # TRAPS_FIELD=hourly（預設）使用逐時 ocm_surface；TRAPS_FIELD=daily25h 使用 DAILY 模式建立的
 # 去潮汐 25 h 日平均產品（ocm_surface_daily25h），DETECT/TRACK 會自動切換來源與 24 h 追蹤參數。
+#
+# TRACK 可用 TRAPS_TRACK_STRONG_QUANTILE 只追蹤各站最強核心；TRACKNULL 對同一組 detect shard 跑
+# 時間置換對照（seed 由 TRAPS_NULL_SEEDS 指定），AGGREGATE 會自動帶入完整的對照組。
+# TRAPS_TRACK_SUBDIR / TRAPS_AGGREGATE_SUBDIR 讓新的追蹤變體寫在舊結果旁邊而不覆寫。
 #
 # 完整說明見 docs/operations/SERVER_RUNBOOK.md。本檔案只做部署/執行編排，實際的
 # TRAP 檢出與追蹤演算法在 `python -m traps` CLI（src/traps/cli.py）。
@@ -34,8 +38,12 @@ set -euo pipefail
 : "${TRAPS_DETECT_ARGS:=}"
 : "${TRAPS_AGGREGATE_ARGS:=}"
 : "${TRAPS_FIELD:=hourly}"
-: "${TRAPS_TRACK_CORE_M:=10000}"
-: "${TRAPS_TRACK_CURVE_M:=20000}"
+: "${TRAPS_TRACK_CORE_M:=}"
+: "${TRAPS_TRACK_CURVE_M:=}"
+: "${TRAPS_TRACK_STRONG_QUANTILE:=}"
+: "${TRAPS_TRACK_SUBDIR:=track}"
+: "${TRAPS_AGGREGATE_SUBDIR:=aggregate}"
+: "${TRAPS_NULL_SEEDS:=1 2}"
 : "${TRAPS_EXPECTED_GIT_COMMIT:=}"
 : "${TRAPS_MIN_FREE_GB:=50}"
 : "${TRAPS_UV_SOURCE:=/data/LBT/cache/formal/ded8463/first-v2-h30-fixed-calendar-m10-435a57a/uv-bin/uv}"
@@ -69,8 +77,10 @@ die() {
 usage() {
   cat >&2 <<'EOF'
 用法: run_traps_server.sh <MODE>
-MODE: SETUP | PREPARE | STAGE | MASKS | DAILY | DETECT | TRACK | AGGREGATE | STATUS
+MODE: SETUP | PREPARE | STAGE | MASKS | DAILY | DETECT | TRACK | TRACKNULL | AGGREGATE | STATUS
 環境變數 TRAPS_FIELD=hourly|daily25h（預設 hourly）
+TRACK/TRACKNULL: TRAPS_TRACK_STRONG_QUANTILE, TRAPS_TRACK_CORE_M, TRAPS_TRACK_CURVE_M, TRAPS_TRACK_SUBDIR
+TRACKNULL: TRAPS_NULL_SEEDS（預設 "1 2"）；AGGREGATE: TRAPS_AGGREGATE_SUBDIR
 詳見 docs/operations/SERVER_RUNBOOK.md
 EOF
 }
@@ -495,66 +505,128 @@ print(' '.join(_parse_months('${TRAPS_MONTHS}')))
 # TRACK
 # ---------------------------------------------------------------------------
 
+# 組出 track-period 的共用追蹤旗標到全域陣列 TRACK_EXTRA_ARGS（TRACK 與 TRACKNULL 共用，
+# 確保對照組與真實追蹤的設定完全相同）。
+#   daily25h：24 h 名目步長、36 h 最大時間缺口，門檻預設 10000/20000 m；
+#   hourly：維持 track-period 預設值，只有設定 TRAPS_TRACK_CORE_M / TRAPS_TRACK_CURVE_M 時才覆寫；
+#   TRAPS_TRACK_STRONG_QUANTILE 有值時加上 --track-strong-quantile。
+build_track_args() {
+  TRACK_EXTRA_ARGS=()
+  if [[ "${TRAPS_FIELD}" == "daily25h" ]]; then
+    TRACK_EXTRA_ARGS+=(
+      --nominal-time-step-hours 24
+      --tracking-max-time-gap-hours 36
+      --tracking-max-core-distance-m "${TRAPS_TRACK_CORE_M:-10000}"
+      --tracking-max-curve-distance-m "${TRAPS_TRACK_CURVE_M:-20000}"
+    )
+  else
+    if [[ -n "${TRAPS_TRACK_CORE_M}" ]]; then
+      TRACK_EXTRA_ARGS+=(--tracking-max-core-distance-m "${TRAPS_TRACK_CORE_M}")
+    fi
+    if [[ -n "${TRAPS_TRACK_CURVE_M}" ]]; then
+      TRACK_EXTRA_ARGS+=(--tracking-max-curve-distance-m "${TRAPS_TRACK_CURVE_M}")
+    fi
+  fi
+  if [[ -n "${TRAPS_TRACK_STRONG_QUANTILE}" ]]; then
+    TRACK_EXTRA_ARGS+=(--track-strong-quantile "${TRAPS_TRACK_STRONG_QUANTILE}")
+  fi
+}
+
+# 以指定平行度跑呼叫端準備的工作陣列 TRACK_JOBS 的 track-period（每項為
+# "domain<TAB>output_dir<TAB>seed"，seed 為空字串代表真實追蹤，否則加 --shuffle-seed）。
+# 只用 `wait -n` 回收，避免對已回收的 pid 再 wait 而誤報失敗。
+run_track_jobs() {
+  local parallelism="$1" log_dir="$2"
+  local failed=0 running=0 job domain out_dir seed
+  for job in "${TRACK_JOBS[@]}"; do
+    IFS=$'\t' read -r domain out_dir seed <<<"${job}"
+    (
+      seed_args=()
+      if [[ -n "${seed}" ]]; then
+        seed_args=(--shuffle-seed "${seed}")
+      fi
+      job_log="${log_dir}/${domain}${seed:+-s${seed}}.log"
+      "${TRAPS_VENV_PY}" -m traps track-period \
+        --shards-root "${TRACK_DETECT_ROOT}/${domain}" \
+        --domain-id "${domain}" \
+        --months "${TRAPS_MONTHS}" \
+        --output-dir "${out_dir}" \
+        --param-id "${TRAPS_PARAM_ID}" \
+        --resume \
+        "${TRACK_EXTRA_ARGS[@]+"${TRACK_EXTRA_ARGS[@]}"}" \
+        "${seed_args[@]+"${seed_args[@]}"}" \
+        >"${job_log}" 2>&1
+    ) &
+    running=$((running + 1))
+    if (( running >= parallelism )); then
+      wait -n || failed=1
+      running=$((running - 1))
+    fi
+  done
+  while (( running > 0 )); do
+    wait -n || failed=1
+    running=$((running - 1))
+  done
+  return "${failed}"
+}
+
 mode_track() {
   with_lock
   [[ -x "${TRAPS_VENV_PY}" ]] || die "找不到 ${TRAPS_VENV_PY}"
 
   local run_dir="${TRAPS_RUNS}/runs/${TRAPS_PARAM_ID}"
-  local detect_root="${run_dir}/detect"
-  local track_root="${run_dir}/track"
-  local log_dir="${run_dir}/logs/track"
+  local track_root="${run_dir}/${TRAPS_TRACK_SUBDIR}"
+  local log_dir="${run_dir}/logs/${TRAPS_TRACK_SUBDIR}"
+  TRACK_DETECT_ROOT="${run_dir}/detect"
   mkdir -p "${track_root}" "${log_dir}"
 
-  # daily25h：24 h 名目步長、36 h 最大時間缺口；hourly 維持 track-period 預設值。
-  local track_extra_args=()
-  if [[ "${TRAPS_FIELD}" == "daily25h" ]]; then
-    track_extra_args=(
-      --nominal-time-step-hours 24
-      --tracking-max-time-gap-hours 36
-      --tracking-max-core-distance-m "${TRAPS_TRACK_CORE_M}"
-      --tracking-max-curve-distance-m "${TRAPS_TRACK_CURVE_M}"
-    )
-  fi
-
-  track_one_domain() {
-    local domain="$1"
-    local job_log="${log_dir}/${domain}.log"
-    "${TRAPS_VENV_PY}" -m traps track-period \
-      --shards-root "${detect_root}/${domain}" \
-      --domain-id "${domain}" \
-      --months "${TRAPS_MONTHS}" \
-      --output-dir "${track_root}/${domain}" \
-      --param-id "${TRAPS_PARAM_ID}" \
-      --resume \
-      "${track_extra_args[@]+"${track_extra_args[@]}"}" \
-      >"${job_log}" 2>&1
-  }
-  export -f track_one_domain
-  export TRAPS_VENV_PY TRAPS_MONTHS TRAPS_PARAM_ID detect_root track_root log_dir
-
-  log "TRACK: ${#DOMAIN_ARRAY[@]} domain，平行度 4"
-  local pids=()
+  build_track_args
+  TRACK_JOBS=()
   local domain
-  local failed=0
-  local running=0
   for domain in "${DOMAIN_ARRAY[@]}"; do
-    track_one_domain "${domain}" &
-    pids+=("$!")
-    running=$((running + 1))
-    if (( running >= 4 )); then
-      wait -n || failed=1
-      running=$((running - 1))
-    fi
-  done
-  local pid
-  for pid in "${pids[@]}"; do
-    wait "${pid}" || failed=1
+    TRACK_JOBS+=("${domain}"$'\t'"${track_root}/${domain}"$'\t')
   done
 
-  if [[ "${failed}" -ne 0 ]]; then
+  log "TRACK: ${#DOMAIN_ARRAY[@]} domain -> ${track_root}，平行度 4"
+  if ! run_track_jobs 4 "${log_dir}"; then
     die "TRACK 有 domain 失敗，詳見 ${log_dir}/"
   fi
   log "TRACK: 完成"
+}
+
+# ---------------------------------------------------------------------------
+# TRACKNULL（時間置換對照；所有 domain × seed 同時平行）
+# ---------------------------------------------------------------------------
+
+mode_tracknull() {
+  with_lock
+  [[ -x "${TRAPS_VENV_PY}" ]] || die "找不到 ${TRAPS_VENV_PY}"
+
+  local run_dir="${TRAPS_RUNS}/runs/${TRAPS_PARAM_ID}"
+  local log_dir="${run_dir}/logs/${TRAPS_TRACK_SUBDIR}_null"
+  TRACK_DETECT_ROOT="${run_dir}/detect"
+  mkdir -p "${log_dir}"
+
+  local seeds
+  read -r -a seeds <<<"${TRAPS_NULL_SEEDS}"
+  [[ "${#seeds[@]}" -gt 0 ]] || die "TRAPS_NULL_SEEDS 不可為空"
+
+  build_track_args
+  TRACK_JOBS=()
+  local seed domain out_root
+  for seed in "${seeds[@]}"; do
+    out_root="${run_dir}/${TRAPS_TRACK_SUBDIR}_null_s${seed}"
+    mkdir -p "${out_root}"
+    for domain in "${DOMAIN_ARRAY[@]}"; do
+      TRACK_JOBS+=("${domain}"$'\t'"${out_root}/${domain}"$'\t'"${seed}")
+    done
+  done
+
+  log "TRACKNULL: seeds=(${seeds[*]}) x ${#DOMAIN_ARRAY[@]} domain = ${#TRACK_JOBS[@]} 個工作全部平行 -> ${run_dir}/${TRAPS_TRACK_SUBDIR}_null_s<seed>"
+  if ! run_track_jobs "${#TRACK_JOBS[@]}" "${log_dir}"; then
+    die "TRACKNULL 有工作失敗，詳見 ${log_dir}/"
+  fi
+  log "TRACKNULL: 完成"
 }
 
 # ---------------------------------------------------------------------------
@@ -566,7 +638,8 @@ mode_aggregate() {
   [[ -x "${TRAPS_VENV_PY}" ]] || die "找不到 ${TRAPS_VENV_PY}"
 
   local run_dir="${TRAPS_RUNS}/runs/${TRAPS_PARAM_ID}"
-  local aggregate_dir="${run_dir}/aggregate"
+  local aggregate_dir="${run_dir}/${TRAPS_AGGREGATE_SUBDIR}"
+  local track_root="${run_dir}/${TRAPS_TRACK_SUBDIR}"
   mkdir -p "${aggregate_dir}"
 
   if ! "${TRAPS_VENV_PY}" -m traps aggregate --help >/dev/null 2>&1; then
@@ -574,12 +647,35 @@ mode_aggregate() {
     exit 2
   fi
 
+  # 自動帶入時間置換對照組：<track subdir>_null_s* 目錄且每個 domain 都有 _SUCCESS 才採用。
+  local null_args=() null_dir null_ok domain
+  if [[ " ${TRAPS_AGGREGATE_ARGS} " != *" --null-track-root "* ]]; then
+    local null_dirs=()
+    for null_dir in "${run_dir}/${TRAPS_TRACK_SUBDIR}"_null_s*; do
+      [[ -d "${null_dir}" ]] || continue
+      null_ok=1
+      for domain in "${DOMAIN_ARRAY[@]}"; do
+        [[ -f "${null_dir}/${domain}/_SUCCESS" ]] || null_ok=0
+      done
+      if [[ "${null_ok}" -eq 1 ]]; then
+        null_dirs+=("${null_dir}")
+      else
+        log "AGGREGATE: 略過未完成的對照組 ${null_dir}（並非所有 domain 都有 _SUCCESS）"
+      fi
+    done
+    if [[ "${#null_dirs[@]}" -gt 0 ]]; then
+      null_args=(--null-track-root "${null_dirs[@]}")
+      log "AGGREGATE: 使用 ${#null_dirs[@]} 組時間置換對照"
+    fi
+  fi
+
   "${TRAPS_VENV_PY}" -m traps aggregate \
-    --track-root "${run_dir}/track" \
+    --track-root "${track_root}" \
     --detect-root "${run_dir}/detect" \
     --output-dir "${aggregate_dir}" \
     --param-id "${TRAPS_PARAM_ID}" \
     --resume \
+    "${null_args[@]+"${null_args[@]}"}" \
     ${TRAPS_AGGREGATE_ARGS}
   log "AGGREGATE: 完成"
 }
@@ -591,7 +687,7 @@ mode_aggregate() {
 mode_status() {
   local run_dir="${TRAPS_RUNS}/runs/${TRAPS_PARAM_ID}"
   local detect_root="${run_dir}/detect"
-  local track_root="${run_dir}/track"
+  local track_root="${run_dir}/${TRAPS_TRACK_SUBDIR}"
 
   echo "== TRAPs STATUS (param_id=${TRAPS_PARAM_ID}) =="
 
@@ -638,9 +734,9 @@ print(' '.join(_parse_months('${TRAPS_MONTHS}')))
       fi
     done <"${summary_file}"
   fi
-  if [[ -d "${log_dir}/track" ]]; then
+  if [[ -d "${log_dir}/${TRAPS_TRACK_SUBDIR}" ]]; then
     local track_log
-    for track_log in "${log_dir}/track"/*.log; do
+    for track_log in "${log_dir}/${TRAPS_TRACK_SUBDIR}"/*.log; do
       [[ -e "${track_log}" ]] || continue
       if grep -qi 'traceback\|error' "${track_log}" 2>/dev/null; then
         echo "### ${track_log}"
@@ -664,6 +760,7 @@ main() {
     DAILY) mode_daily ;;
     DETECT) mode_detect ;;
     TRACK) mode_track ;;
+    TRACKNULL) mode_tracknull ;;
     AGGREGATE) mode_aggregate ;;
     STATUS) mode_status ;;
     ""|-h|--help) usage; exit 2 ;;
