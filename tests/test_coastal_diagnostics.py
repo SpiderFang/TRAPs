@@ -620,3 +620,24 @@ def test_prop_min_obs_auto_depends_on_step() -> None:
     assert agg.resolve_prop_min_obs(None, 24.0) == 3
     assert agg.resolve_prop_min_obs(5, 1.0) == 5
     assert agg.resolve_prop_min_obs(2, 1.0) == 3
+
+
+@pytest.mark.filterwarnings("ignore")
+def test_propagation_footnote_uses_effective_min_obs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    data = _coastal_data()
+    ny, nx = data.site_mask.shape
+    captured = _capture_texts(monkeypatch)
+    tracks = example_figures.TrackFigureInputs(
+        x_m_axis=np.arange(nx) * 500.0, y_m_axis=np.arange(ny) * 500.0, long_track_hours=24.0,
+        long_tracks=[(30.0, np.linspace(1000, 3000, 4), np.full(4, 2000.0))], n_long_total=1,
+        prop_cx_kmday=np.array([1.0, 2.0]), prop_cy_kmday=np.array([0.5, -1.0]), prop_track_n=2, nominal_step_hours=1.0,
+        prop_stationary=np.array([False, False]), prop_resid_rms_m=np.array([100.0, 200.0]), prop_min_obs=7,
+    )
+    example_figures.render_track_figures(
+        tmp_path, data, tracks, font_selection=FAKE_FONT, coastline=None, state_label="MODEL_ONLY", param_id="p",
+        period_label="202401-202512", dpi=50,
+    )
+    texts = [t for name, boxes in captured if Path(name).name.endswith("_propagation.png") for t, _ in boxes]
+    joined = " ".join(texts)
+    assert texts and "至少 3 個觀測" not in joined
+    assert "（至少 7 個觀測）" in joined and "{min_obs}" not in joined

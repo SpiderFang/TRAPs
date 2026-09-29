@@ -1078,7 +1078,7 @@ def render_propagation(
     resid_text = ""
     if tracks.prop_resid_rms_m is not None and np.size(tracks.prop_resid_rms_m):
         resid_text = f"  {T['propagation_resid']} {float(np.median(tracks.prop_resid_rms_m)):.0f} {T['unit_m']}"
-    full_footer = f"{footer}\n{T['propagation_fitted']} {n_fitted} {T['propagation_tracks']}{resid_text}\n{T['propagation_fit_note']}"
+    full_footer = f"{footer}\n{T['propagation_fitted']} {n_fitted} {T['propagation_tracks']}{resid_text}\n{T['propagation_fit_note'].format(min_obs=int(tracks.prop_min_obs) if tracks.prop_min_obs else 3)}"
     footer_h = _footer_height_inch(full_footer)
     hist_w, hist_h = 3.5, 3.1
     rose_size = 3.1

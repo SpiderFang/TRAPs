@@ -210,7 +210,7 @@ FIGURE_TEXT: Final[Mapping[str, str]] = MappingProxyType(
         "propagation_moving": "移動 track",
         "propagation_stationary": "靜止 track",
         "propagation_stationary_def": "靜止：擬合位移小於 1 格",
-        "propagation_fit_note": "每條 track 以核心位置 x(t)、y(t) 最小平方線性擬合（至少 3 個觀測）；直方圖與玫瑰圖只含移動 track，只描述模型內 TRAP 核心的位移，不等於水體或漂浮物速度。",
+        "propagation_fit_note": "每條 track 以核心位置 x(t)、y(t) 最小平方線性擬合（至少 {min_obs} 個觀測）；直方圖與玫瑰圖只含移動 track，只描述模型內 TRAP 核心的位移，不等於水體或漂浮物速度。",
         "propagation_resid": "殘差 RMS 中位數",
         "propagation_stationary_frac": "靜止比例",
         "propagation_min_obs_a": "擬合至少",
