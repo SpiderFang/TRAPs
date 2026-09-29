@@ -345,6 +345,9 @@ $VENV_PY -m traps aggregate \
 額外旗標經 `TRAPS_AGGREGATE_ARGS` 傳入，腳本不需修改。`site_statistics.csv` 新增 `prop_n`、`prop_cx_median_kmday`、
 `prop_cy_median_kmday`、`prop_speed_median_kmday`、`prop_speed_p90_kmday`（僅 stratum `all`）。
 
+**WP-I 子格點核心與近岸診斷**：DETECT 起 TRAP 核心以 3×3 二次曲面做子格點定位（`--no-core-subgrid-refine` 可關閉；manifest `detection_config.core_subgrid = "quadratic_3x3"`），shard schema 升為 `traps.period.shard.v2`（新增 `core_grid_x_m`、`core_grid_y_m`、`core_refined`、`core_coast_distance_m`，`grid_reference.npz` 新增 `coast_distance_m`）。**舊版 v1 shard 仍可讀，但核心留在格點上、傳播速度仍受格點量化；要得到子格點結果須重跑 DETECT 與 TRACK（含 TRACKNULL）**，AGGREGATE 才能與 v2 對齊。AGGREGATE 新增 `--coastal-buffer-km`（預設 3，經 `TRAPS_AGGREGATE_ARGS` 傳入）、`--prop-min-obs`；傳播速度為逐 track 線性擬合，位移小於 1 格者判為靜止並排除於方向玫瑰與速度直方圖。`site_statistics.csv` 新增 `prop_n_tracks／n_moving／n_stationary／stationary_frac／resid_rms_median_m`、`frac_cores_within_buffer`、`frac_strong_cores_within_buffer`、`frac_long_tracks_within_buffer`、`offshore_*`（近岸外強核心出現率、熱點、壽命比例）與 `coastal_*` 壽命比例；另輸出 `site_<id>_coastal_diagnostic.png` 與 `site_<id>_example_coastal.png`，所有站圖畫虛線近岸帶。
+判讀：近岸靜止的長壽命 TRAP 代表地形鎖定的應變場或邊界效應，不是漂移收斂帶；請以近岸外（`offshore_*`）數值為保守結論依據，近岸型結果須連同靜止比例一併呈報。
+
 圖面文字為繁體中文，需要系統有 Noto Sans CJK TC（本伺服器
 `/usr/share/fonts/opentype/noto/NotoSansCJK-*.ttc`）或候選清單中的其他字型；
 `aggregate` 會先以 FreeType charmap 檢查字元涵蓋，找不到合格字型即在寫檔前以

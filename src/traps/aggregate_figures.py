@@ -38,6 +38,26 @@ S1_DAY_LABEL = r"$s_1$ ($\mathrm{day^{-1}}$)"
 
 
 @dataclass
+class CoastalDiagnosticData:
+    """近岸診斷圖（``site_<id>_coastal_diagnostic.png``）所需的彙整資料。
+
+    直方圖為固定 bin 的計數（不保留逐核心陣列，避免全期核心數造成記憶體負擔）；壽命列表只含
+    未截尾 track，依 track 平均核心距岸距離是否小於緩衝帶分為近岸型與近岸外，並附各 seed 的隨機對照。
+    """
+
+    buffer_km: float
+    hist_edges_km: np.ndarray
+    hist_all: np.ndarray
+    hist_strong: np.ndarray
+    hist_long: np.ndarray
+    lifetimes_offshore: Sequence[float] = ()
+    lifetimes_coastal: Sequence[float] = ()
+    null_offshore: Sequence[Sequence[float]] = ()
+    null_coastal: Sequence[Sequence[float]] = ()
+    nominal_step_hours: float = 1.0
+
+
+@dataclass
 class SiteFigureData:
     """一個研究站繪圖所需的全部資料（已限制在該站分析區、不含其他站）。"""
 
@@ -77,6 +97,12 @@ class SiteFigureData:
     """名目時間步長（小時）；24 或門檻皆為 24 的倍數時，壽命 CCDF 以「天」顯示。"""
     lifetime_scope_text: str = ""
     """壽命統計對象說明（例如「強核心結構（各站前 10%）」）；空字串表示不註明。"""
+    coast_distance_m: np.ndarray | None = None
+    """整個 domain 的核心距最近非分析海域格點距離場（m，與 lon/lat 同形）；``None`` 時不畫近岸緩衝帶。"""
+    coast_buffer_km: float = 3.0
+    """近岸緩衝帶寬度（km）。"""
+    coastal: CoastalDiagnosticData | None = None
+    """近岸診斷圖資料；``None`` 時不輸出 ``coastal_diagnostic``。"""
 
 
 def _load_matplotlib() -> tuple[Any, Any]:
@@ -286,10 +312,51 @@ def _add_inch_axes(figure: Any, x: float, y: float, width: float, height: float)
     return figure.add_axes((x / fig_w, y / fig_h, width / fig_w, height / fig_h))
 
 
+def coast_buffer_label(data: SiteFigureData) -> str:
+    """近岸緩衝帶圖例文字，例如「近岸 3 km 帶」。"""
+
+    return f"{T['coast_buffer_prefix']} {float(data.coast_buffer_km):g} {T['coast_buffer_suffix']}"
+
+
+COAST_BUFFER_COLOUR = "#6a3d9a"
+
+
+def _draw_coast_buffer(axis: Any, data: SiteFigureData, view: tuple[slice, slice]) -> Any | None:
+    """在地圖上以細虛線畫出近岸緩衝帶外緣（距離場的 buffer 等值線），回傳圖例 handle。
+
+    距離場整個 domain 計算，等值線在視窗內不存在（全部近岸內或全部近岸外）時不畫也不回傳 handle。
+    """
+
+    if data.coast_distance_m is None:
+        return None
+    from matplotlib.lines import Line2D
+
+    rows, cols = view
+    level = float(data.coast_buffer_km) * 1000.0
+    field = np.asarray(data.coast_distance_m, dtype=np.float64)[rows, cols]
+    finite = field[np.isfinite(field)]
+    if finite.size == 0 or not (float(finite.min()) < level < float(finite.max())):
+        return None
+    axis.contour(
+        data.lon[cols], data.lat[rows], np.ma.masked_invalid(field), levels=[level], colors=COAST_BUFFER_COLOUR,
+        linewidths=0.7, linestyles="--", zorder=6.5,
+    )
+    return Line2D([], [], color=COAST_BUFFER_COLOUR, linestyle="--", linewidth=1.0, label=coast_buffer_label(data))
+
+
 def _prepare_map_axis(
-    axis: Any, data: SiteFigureData, view: tuple[slice, slice], coastline: CoastlineGeometry | None, *, max_ticks: int | None = None
-) -> None:
-    """設定經緯度軸標籤、等比例（考慮 cos 緯度）、海岸線疊圖與站點錨點（只有標記，沒有半徑圓）。"""
+    axis: Any,
+    data: SiteFigureData,
+    view: tuple[slice, slice],
+    coastline: CoastlineGeometry | None,
+    *,
+    max_ticks: int | None = None,
+    draw_buffer: bool = True,
+) -> Any | None:
+    """設定經緯度軸標籤、等比例（考慮 cos 緯度）、海岸線疊圖、近岸緩衝帶與站點錨點（只有標記，沒有半徑圓）。
+
+    回傳近岸緩衝帶的圖例 handle（沒有畫時為 ``None``），由呼叫端併入該圖自己的圖例。
+    """
 
     rows, cols = view
     lon = data.lon[cols]
@@ -313,6 +380,7 @@ def _prepare_map_axis(
     anchor_lon, anchor_lat = data.anchor_lonlat
     if lon.min() <= anchor_lon <= lon.max() and lat.min() <= anchor_lat <= lat.max():
         axis.plot(anchor_lon, anchor_lat, marker="+", color="#37474f", markersize=8, markeredgewidth=1.4, linestyle="none", zorder=8)
+    return _draw_coast_buffer(axis, data, view) if draw_buffer else None
 
 
 def _save(figure: Any, plt: Any, output_path: Path, dpi: int) -> None:
@@ -357,6 +425,7 @@ def render_spatial(output_path: Path, data: SiteFigureData, *, coastline: Coastl
     figure = plt.figure(figsize=(fig_w, fig_h))
     pairs: list[tuple[Any, Any]] = []
     axes_list: list[Any] = []
+    buffer_handles: list[Any] = []
     for index, (title, key, label, cmap) in enumerate(fields):
         row, column = divmod(index, 2)
         x0 = x_offset + column * column_pitch + _LEFT_INCH
@@ -370,10 +439,12 @@ def render_spatial(output_path: Path, data: SiteFigureData, *, coastline: Coastl
         colorbar.set_label(label)
         pairs.append((axis, cax))
         axis.set_title(title, fontsize=10)
-        _prepare_map_axis(axis, data, (rows, cols), coastline)
+        buffer_handle = _prepare_map_axis(axis, data, (rows, cols), coastline)
+        if buffer_handle is not None:
+            buffer_handles.append(buffer_handle)
         axes_list.append(axis)
     axes_list[0].plot([], [], marker="+", color="#37474f", linestyle="none", label=T["anchor"])
-    axes_list[0].legend(loc="lower right", fontsize=7)
+    axes_list[0].legend(handles=[*axes_list[0].get_legend_handles_labels()[0], *buffer_handles[:1]], loc="lower right", fontsize=7)
     align_colorbars_to_axes(figure, pairs)
     figure.suptitle(f"{data.site_name_zh} — {T['spatial_title']}", fontsize=13, y=1.0 - 0.12 / fig_h, va="top")
     _place_footer(figure, footer)
@@ -450,7 +521,9 @@ def render_hotspots(
                 [], [], linestyle="none", marker="o", markersize=5, markerfacecolor="#111111", markeredgecolor="white", label=T["hotspot_core_legend"]
             )
         )
-    _prepare_map_axis(axis, data, (rows, cols), coastline, max_ticks=5)
+    buffer_handle = _prepare_map_axis(axis, data, (rows, cols), coastline, max_ticks=5)
+    if buffer_handle is not None:
+        handles.append(buffer_handle)
     if handles:
         axis.legend(handles=handles, loc="lower right", fontsize=7, framealpha=0.85)
     axis.set_title(title, fontsize=11)
@@ -491,7 +564,7 @@ def render_seasonal(output_path: Path, data: SiteFigureData, *, coastline: Coast
         masked = np.ma.masked_invalid(np.asarray(data.spatial_seasons[season]["curve_pass_frequency"], dtype=np.float64)[rows, cols])
         mesh = axis.pcolormesh(lon, lat, masked, shading="auto", cmap="YlOrRd", vmin=vmin, vmax=vmax)
         axis.set_title(T[f"season_{season}"], fontsize=10)
-        _prepare_map_axis(axis, data, (rows, cols), coastline, max_ticks=3)
+        _prepare_map_axis(axis, data, (rows, cols), coastline, max_ticks=3, draw_buffer=False)
         if index > 0:
             axis.set_ylabel("")
         map_axes.append(axis)
@@ -655,6 +728,86 @@ def render_lifetime(output_path: Path, data: SiteFigureData, *, footer: str, dpi
     return output_path
 
 
+def render_coastal_diagnostic(output_path: Path, data: SiteFigureData, *, footer: str, dpi: int = 150) -> Path:
+    """近岸診斷：(a) 核心距岸距離分布（全部／強核心／長壽命 track 核心）；(b) 近岸型與近岸外的壽命 CCDF 與各自的隨機對照。
+
+    (a) 三組各自正規化為比例（總和 1），因此可比較「分布形狀」而非數量；虛線為近岸緩衝帶外緣。
+    (b) 近岸型＝track 平均核心距岸小於緩衝帶，近岸外＝不小於；各配對其時間置換 null（各 seed 平均與最小–最大帶）。
+    讀者可由此判斷長壽命結構是否集中在海岸帶、去除海岸帶後是否仍超出隨機對照。
+    """
+
+    _, plt = _load_matplotlib()
+    diag = data.coastal
+    assert diag is not None
+    fig_w, fig_h = 13.0, 5.8
+    table_lines = [T["coast_type_note"]]
+    figure, (left, right) = plt.subplots(1, 2, figsize=(fig_w, fig_h))
+    figure.subplots_adjust(left=0.07, right=0.97, bottom=(_footer_height_inch(footer) + 0.95) / fig_h, top=1.0 - 1.05 / fig_h, wspace=0.25)
+
+    edges = np.asarray(diag.hist_edges_km, dtype=np.float64)
+    groups = (
+        (diag.hist_all, T["coast_hist_all"], "#1b4965", "-"),
+        (diag.hist_strong, T["coast_hist_strong"], "#c1121f", "-"),
+        (diag.hist_long, T["coast_hist_long"], "#2a9d8f", "-"),
+    )
+    any_hist = False
+    for counts, label, colour, style in groups:
+        counts = np.asarray(counts, dtype=np.float64)
+        total = float(counts.sum())
+        if total <= 0.0:
+            continue
+        any_hist = True
+        left.step(edges, np.append(counts / total, counts[-1] / total), where="post", color=colour, linestyle=style, linewidth=1.6, label=f"{label} (n={int(total)})")
+    left.axvline(float(diag.buffer_km), color=COAST_BUFFER_COLOUR, linestyle="--", linewidth=1.1, label=coast_buffer_label(data))
+    if any_hist:
+        left.legend(fontsize=8, loc="upper right")
+    else:
+        left.text(0.5, 0.5, T["no_data"], ha="center", va="center", transform=left.transAxes)
+    left.set_xlim(float(edges[0]), float(edges[-1]))
+    left.set_xlabel(T["coast_dist_xlabel"])
+    left.set_ylabel(T["coast_hist_ylabel"])
+    left.set_title(T["coast_hist_title"], fontsize=10)
+    left.grid(alpha=0.25)
+
+    daily = float(diag.nominal_step_hours) >= 24.0
+    unit_h = 24.0 if daily else 1.0
+    drawn_any = False
+    curves = (
+        (diag.lifetimes_offshore, diag.null_offshore, "#1b4965", T["coast_offshore_real"], T["coast_offshore_null"], "-"),
+        (diag.lifetimes_coastal, diag.null_coastal, "#e76f51", T["coast_coastal_real"], T["coast_coastal_null"], "-"),
+    )
+    for lifetimes, null_sets, colour, real_label, null_label, style in curves:
+        positive = [float(v) for v in lifetimes if float(v) > 0]
+        x_values, survival = _ccdf(positive)
+        null_positive = [[float(v) for v in values if float(v) > 0] for values in null_sets]
+        grid, null_mean, null_low, null_high = null_ccdf_band(null_positive, x_values)
+        if x_values.size:
+            drawn_any = True
+            right.step(x_values / unit_h, survival, where="post", color=colour, linestyle=style, linewidth=1.8, label=f"{real_label} (n={x_values.size})")
+        if grid.size:
+            drawn_any = True
+            floor_candidates = null_high[null_high > 0]
+            floor = 0.5 * float(floor_candidates.min()) if floor_candidates.size else 1.0e-3
+            right.fill_between(grid / unit_h, np.maximum(null_low, floor), np.maximum(null_high, floor), step="post", color=colour, alpha=0.15, linewidth=0)
+            right.step(grid / unit_h, np.where(null_mean > 0, null_mean, np.nan), where="post", color=colour, linestyle="--", linewidth=1.4, label=null_label)
+    if drawn_any:
+        right.set_yscale("log")
+        right.set_xscale("log")
+        right.legend(fontsize=8, loc="upper right")
+    else:
+        right.text(0.5, 0.5, T["coast_no_tracks"], ha="center", va="center", transform=right.transAxes)
+    right.set_xlabel(T["lifetime_days"] if daily else T["lifetime_hours"])
+    right.set_ylabel(T["ccdf_ylabel"])
+    right.set_title(T["coast_ccdf_title"], fontsize=10)
+    right.grid(alpha=0.25)
+
+    figure.suptitle(f"{data.site_name_zh} — {T['coastal_diag_title']}", fontsize=13, y=1.0 - 0.12 / fig_h, va="top")
+    figure.text(0.07, (_footer_height_inch(footer) + 0.12) / fig_h, "\n".join(table_lines), ha="left", va="bottom", fontsize=8, color="#343a40")
+    _place_footer(figure, footer)
+    _save(figure, plt, output_path, dpi)
+    return output_path
+
+
 def render_timeseries(output_path: Path, data: SiteFigureData, *, footer: str, dpi: int = 150) -> Path:
     """逐日含強核心的有效快照比例與平均通過格點比例；30 日滑動平均，資料缺口以斷線呈現。"""
 
@@ -716,11 +869,17 @@ def render_site_figures(
         render_seasonal(site_dir / f"{stem}_seasonal.png", data, coastline=coastline, footer=footer, dpi=dpi)
         render_lifetime(site_dir / f"{stem}_lifetime.png", data, footer=footer, dpi=dpi)
         render_timeseries(site_dir / f"{stem}_timeseries.png", data, footer=footer, dpi=dpi)
-    return [f"figures/{data.site_id}/{stem}_{kind}.png" for kind in ("spatial", "hotspots", "seasonal", "lifetime", "timeseries")]
+        paths = [f"figures/{data.site_id}/{stem}_{kind}.png" for kind in ("spatial", "hotspots", "seasonal", "lifetime", "timeseries")]
+        if data.coastal is not None:
+            render_coastal_diagnostic(site_dir / f"{stem}_coastal_diagnostic.png", data, footer=footer, dpi=dpi)
+            paths.append(f"figures/{data.site_id}/{stem}_coastal_diagnostic.png")
+    return paths
 
 
 __all__ = [
+    "CoastalDiagnosticData",
     "SiteFigureData",
+    "coast_buffer_label",
     "daily_series",
     "render_site_figures",
     "running_mean_with_gaps",

@@ -212,7 +212,7 @@ def test_detect_shards_writes_traceable_and_resumable_artifacts(three_month_root
         assert (output_dir / name).is_file(), name
 
     manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["schema_version"] == "traps.period.shard.v1"
+    assert manifest["schema_version"] == "traps.period.shard.v2"
     assert manifest["month"] == "202401"
     assert manifest["domain_id"] == DOMAIN_ID
     assert manifest["snapshot_count"] == len(JAN_HOURS)
@@ -499,3 +499,162 @@ def test_curve_pass_cells_matches_curve_intersects_mask() -> None:
             cells = curve_pass_cells(curve, x_m, y_m, mask.shape)
             actual = bool(np.any(mask.flat[cells])) if cells.size else False
             assert actual == expected
+
+
+# ---------------------------------------------------------------------------
+# WP-I：近岸距離場與 shard schema v2
+# ---------------------------------------------------------------------------
+
+
+def _brute_force_coast_distance(mask: np.ndarray, x_axis: np.ndarray, y_axis: np.ndarray, cap: float) -> np.ndarray:
+    xx, yy = np.meshgrid(x_axis, y_axis, indexing="xy")
+    land = np.argwhere(~mask)
+    result = np.full(mask.shape, cap)
+    for row, col in np.argwhere(mask):
+        if land.size:
+            distance = np.hypot(xx[land[:, 0], land[:, 1]] - xx[row, col], yy[land[:, 0], land[:, 1]] - yy[row, col]).min()
+            result[row, col] = min(distance, cap)
+    result[~mask] = 0.0
+    return result
+
+
+def test_coast_distance_field_on_synthetic_mask_matches_brute_force() -> None:
+    from traps.period import compute_coast_distance_field
+
+    ny, nx = 14, 17
+    x_axis = np.arange(nx) * 1000.0
+    y_axis = np.arange(ny) * 1000.0
+    mask = np.ones((ny, nx), dtype=bool)
+    mask[:, 0] = False  # 西岸一整欄
+    mask[6, 9] = False  # 孤島一格
+    field = compute_coast_distance_field(mask, x_axis, y_axis)
+    assert field.dtype == np.float32 and field.shape == mask.shape
+    assert field[6, 9] == 0.0 and np.all(field[:, 0] == 0.0)
+    assert field[6, 8] == pytest.approx(1000.0) and field[6, 10] == pytest.approx(1000.0)
+    assert field[7, 10] == pytest.approx(np.hypot(1000.0, 1000.0), rel=1e-6)  # 對角格：最近非海域格點為孤島
+    assert field[0, 3] == pytest.approx(3000.0)  # 只受西岸影響
+    assert np.allclose(field, _brute_force_coast_distance(mask, x_axis, y_axis, 30_000.0), atol=1e-2)
+
+    # 隨機遮罩、非等距且遞減的 y 軸；小 cap 會使遠處飽和（不是陸地）
+    rng = np.random.default_rng(3)
+    random_mask = rng.random((12, 15)) > 0.15
+    x_random = np.cumsum(rng.uniform(800.0, 1200.0, 15))
+    y_random = -np.cumsum(rng.uniform(800.0, 1200.0, 12))
+    for cap in (30_000.0, 2_500.0):
+        got = compute_coast_distance_field(random_mask, x_random, y_random, cap_m=cap)
+        assert np.allclose(got, _brute_force_coast_distance(random_mask, x_random, y_random, cap), atol=1e-2)
+
+
+def test_coast_distance_ignores_cells_outside_grid_and_handles_no_land() -> None:
+    from traps.period import compute_coast_distance_field
+
+    axis = np.arange(6) * 500.0
+    all_ocean = compute_coast_distance_field(np.ones((6, 6), dtype=bool), axis, axis, cap_m=20_000.0)
+    assert np.all(all_ocean == 20_000.0)  # 格網外不算陸地，也就沒有海岸
+    edge = np.ones((6, 6), dtype=bool)
+    edge[:, -1] = False
+    assert compute_coast_distance_field(edge, axis, axis)[3, 0] == pytest.approx(2500.0)
+
+
+def test_sample_coast_distance_bilinear_decreasing_axis_and_outside() -> None:
+    from traps.period import sample_coast_distance
+
+    x_axis = np.array([0.0, 1000.0, 2000.0])
+    y_axis = np.array([2000.0, 1000.0, 0.0])  # 遞減
+    field = np.array([[0.0, 0.0, 0.0], [1000.0, 1000.0, 1000.0], [2000.0, 2000.0, 2000.0]])
+    values = sample_coast_distance(field, x_axis, y_axis, np.array([500.0, 1500.0, 2500.0, 0.0]), np.array([1500.0, 500.0, 500.0, 0.0]))
+    assert values[0] == pytest.approx(500.0) and values[1] == pytest.approx(1500.0)
+    assert np.isnan(values[2])  # 格網外
+    assert values[3] == pytest.approx(2000.0)
+
+
+def _downgrade_shard_to_v1(shard_dir: Path) -> None:
+    """把 v2 shard 改寫成 v1 布局（移除新欄位與距離場、去掉 detection_config 新鍵），重寫 manifest。"""
+
+    from traps.period import _SHARD_ARTIFACT_NAMES, _artifact_records, _write_manifest_with_checksum
+
+    detections_path = shard_dir / "detections.npz"
+    with np.load(detections_path) as archive:
+        kept = {name: np.array(archive[name]) for name in archive.files if name not in ("core_grid_x_m", "core_grid_y_m", "core_refined", "core_coast_distance_m")}
+    np.savez(detections_path, **kept)
+    grid_path = shard_dir / "grid_reference.npz"
+    with np.load(grid_path) as archive:
+        grid = {name: np.array(archive[name]) for name in archive.files if name != "coast_distance_m"}
+    np.savez(grid_path, **grid)
+    manifest = json.loads((shard_dir / "manifest.json").read_text(encoding="utf-8"))
+    manifest["schema_version"] = "traps.period.shard.v1"
+    for key in ("core_subgrid", "coast_distance"):
+        manifest.pop(key, None)
+    for key in ("core_subgrid", "core_subgrid_refine"):
+        manifest["detection_config"].pop(key, None)
+    manifest["artifacts"] = _artifact_records(shard_dir, _SHARD_ARTIFACT_NAMES)
+    _write_manifest_with_checksum(shard_dir, manifest)
+
+
+def test_detect_shards_v2_columns_and_track_period_coast_distance(three_month_root: Path, tmp_path: Path) -> None:
+    from traps.period import sample_coast_distance
+
+    _run_all_shards(three_month_root, tmp_path)
+    shard_dir = _shard_output(tmp_path, "202401")
+    manifest = json.loads((shard_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["detection_config"]["core_subgrid"] == "quadratic_3x3"
+    assert manifest["detection_config"]["core_subgrid_refine"] is True
+    assert manifest["core_subgrid"] == "quadratic_3x3"
+    with np.load(shard_dir / "detections.npz") as archive, np.load(shard_dir / "grid_reference.npz") as grid:
+        assert archive["core_x_m"].size > 0
+        for name in ("core_grid_x_m", "core_grid_y_m", "core_refined", "core_coast_distance_m"):
+            assert archive[name].shape == archive["core_x_m"].shape, name
+        assert archive["core_refined"].dtype == bool and archive["core_refined"].any()
+        coast = grid["coast_distance_m"]
+        assert coast.shape == grid["analysis_ocean_mask"].shape
+        expected = sample_coast_distance(coast, grid["x_m_axis"], grid["y_m_axis"], archive["core_x_m"], archive["core_y_m"])
+        assert np.allclose(archive["core_coast_distance_m"], expected, equal_nan=False)
+        # 整格網都是海域（合成遮罩）：沒有非海域格點 → 飽和上限
+        assert np.all(coast == 30_000.0) == bool(np.all(grid["analysis_ocean_mask"]))
+        # 細化位置相對格點節點的偏移在 ±0.5 格內；未細化者等於節點
+        spacing = float(np.median(np.diff(grid["x_m_axis"])))
+        offset = np.hypot(archive["core_x_m"] - archive["core_grid_x_m"], archive["core_y_m"] - archive["core_grid_y_m"])
+        assert np.all(offset <= 0.5 * spacing * np.sqrt(2.0) + 1e-6)
+        assert np.all(offset[~archive["core_refined"]] == 0.0)
+        assert np.any(offset[archive["core_refined"]] > 0.0)  # 不再全落在 1 格節點上
+
+    track_output = tmp_path / "track"
+    result = _run_cli("track-period", "--shards-root", str(tmp_path / "shards"), "--domain-id", DOMAIN_ID, "--output-dir", str(track_output), "--months", "202401-202403")
+    assert result.returncode == 0, result.stderr
+    with np.load(track_output / "track_observations.npz") as observations:
+        assert observations["core_coast_distance_m"].shape == observations["core_x_m"].shape
+        assert np.all(np.isfinite(observations["core_coast_distance_m"]))
+        # 追蹤用細化核心：至少有一個核心座標不落在格點節點
+        with np.load(shard_dir / "grid_reference.npz") as grid:
+            x_axis = grid["x_m_axis"]
+        assert np.any(np.min(np.abs(observations["core_x_m"][:, None] - x_axis[None, :]), axis=1) > 1e-6)
+
+
+def test_track_period_and_aggregate_accept_v1_shards_and_refuse_mixed(three_month_root: Path, tmp_path: Path) -> None:
+    _run_all_shards(three_month_root, tmp_path)
+    for month in ("202401", "202402", "202403"):
+        _downgrade_shard_to_v1(_shard_output(tmp_path, month))
+    track_output = tmp_path / "track_v1"
+    result = _run_cli("track-period", "--shards-root", str(tmp_path / "shards"), "--domain-id", DOMAIN_ID, "--output-dir", str(track_output), "--months", "202401-202403")
+    assert result.returncode == 0, result.stderr  # v1：核心取格點節點，近岸距離由遮罩補算
+    with np.load(track_output / "track_observations.npz") as observations:
+        assert np.all(np.isfinite(observations["core_coast_distance_m"]))
+
+    # 混用 v1 與 v2 → detection_config 不一致，明確拒絕
+    mixed_root = tmp_path / "mixed"
+    for month in ("202401", "202402", "202403"):
+        result = _run_detect_shards(three_month_root, month=month, output_dir=mixed_root / month)
+        assert result.returncode == 0, result.stderr
+    _downgrade_shard_to_v1(mixed_root / "202401")
+    refused = _run_cli("track-period", "--shards-root", str(mixed_root), "--domain-id", DOMAIN_ID, "--output-dir", str(tmp_path / "track_mixed"), "--months", "202401-202403")
+    assert refused.returncode != 0 and "detection_config" in (refused.stderr + refused.stdout)
+
+    # 不受支援的 schema 版本
+    manifest_path = mixed_root / "202402" / "manifest.json"
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["schema_version"] = "traps.period.shard.v0"
+    from traps.period import _write_manifest_with_checksum
+
+    _write_manifest_with_checksum(mixed_root / "202402", payload)
+    bad = _run_cli("track-period", "--shards-root", str(mixed_root), "--domain-id", DOMAIN_ID, "--output-dir", str(tmp_path / "track_bad"), "--months", "202402")
+    assert bad.returncode != 0 and "schema_version" in (bad.stderr + bad.stdout)

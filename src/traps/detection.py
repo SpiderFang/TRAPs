@@ -3,7 +3,10 @@
 實作只接受二維、軸對齊且近似 rectilinear 的公尺格網。速度梯度使用完整的
 中心差分 stencil；中心點、四個正交鄰點及必要的局部極小值鄰域只要有一格
 無效，就不產生導數或曲線採樣。這個保守規則刻意避免把海岸或缺值當成 0，
-也避免曲線穿過遮罩缺口。若設定指定 `smoothing_radius_cells`（0–3 格），
+也避免曲線穿過遮罩缺口。核心先以格點局部極小值檢出，再以 3x3 有效 stencil 的
+二維二次曲面擬合提升到次網格位置（``core_subgrid_refine``，方法記錄為
+``quadratic_3x3``），避免核心恆落在 1 km 格點而使位移被格距量化；曲線積分從
+細化後的位置開始。若設定指定 `smoothing_radius_cells`（0–3 格），
 會先以 `_mask_safe_graph_diffusion` 對速度做限次的 mask-safe 四鄰接 graph
 diffusion，再計算應變率；擴散只沿有效海域格點的圖傳播，不會跨越陸地或
 缺值連通。輸入是 `(row=y, column=x)` 陣列，`u/v` 的單位由上游 OCM schema
@@ -480,6 +483,58 @@ def _find_core_candidates(
     return accepted
 
 
+def refine_core_quadratic(
+    s1: np.ndarray,
+    derivative_valid: np.ndarray,
+    grid: "_RectilinearGrid",
+    row: int,
+    col: int,
+) -> tuple[float, float] | None:
+    """以 3x3 有效 stencil 的二維二次曲面擬合，回傳次網格核心位置（公尺）。
+
+    擬合 ``s1 ≈ a + b x + c y + d x² + e x y + f y²``（x、y 為相對格點節點的公尺
+    偏移），9 個樣本、6 個參數的最小平方解；取駐點 ``H p = -g``，其中
+    ``H = [[2d, e], [e, 2f]]``。只有 Hessian 正定（駐點為極小值）且偏移在每軸
+    ``±0.5`` 格內時才接受，否則回傳 ``None``，呼叫端保留格點節點並標記
+    ``refined=False``。3x3 內任一格無效或非有限也回傳 ``None``，不對缺值補洞。
+    """
+
+    ny, nx = s1.shape
+    if row < 1 or col < 1 or row > ny - 2 or col > nx - 2:
+        return None
+    window_valid = derivative_valid[row - 1 : row + 2, col - 1 : col + 2]
+    window = np.asarray(s1[row - 1 : row + 2, col - 1 : col + 2], dtype=np.float64)
+    if not np.all(window_valid) or not np.all(np.isfinite(window)):
+        return None
+    x0 = float(grid.x_axis_m[col])
+    y0 = float(grid.y_axis_m[row])
+    xs = np.asarray(grid.x_axis_m[col - 1 : col + 2], dtype=np.float64) - x0
+    ys = np.asarray(grid.y_axis_m[row - 1 : row + 2], dtype=np.float64) - y0
+    # 以格距無因次化後再擬合，避免 x² 與 s1（約 1e-5）的量級差造成條件數惡化。
+    sx = float(grid.dx_m)
+    sy = float(grid.dy_m)
+    xx, yy = np.meshgrid(xs / sx, ys / sy)  # (row=y, col=x)
+    xf = xx.reshape(-1)
+    yf = yy.reshape(-1)
+    scale = float(np.max(np.abs(window)))
+    if not np.isfinite(scale) or scale <= 0.0:
+        return None
+    values = window.reshape(-1) / scale
+    design = np.column_stack((np.ones(9), xf, yf, xf * xf, xf * yf, yf * yf))
+    coefficients, _, rank, _ = np.linalg.lstsq(design, values, rcond=None)
+    if rank < 6:
+        return None
+    _, b, c, d, e, f = (float(value) for value in coefficients)
+    hessian = np.array([[2.0 * d, e], [e, 2.0 * f]])
+    determinant = float(hessian[0, 0] * hessian[1, 1] - hessian[0, 1] ** 2)
+    if not (hessian[0, 0] > 0.0 and determinant > 0.0):
+        return None
+    offset = np.linalg.solve(hessian, -np.array([b, c]))
+    if not np.all(np.isfinite(offset)) or abs(offset[0]) > 0.5 or abs(offset[1]) > 0.5:
+        return None
+    return (x0 + float(offset[0]) * sx, y0 + float(offset[1]) * sy)
+
+
 def _build_detection(
     row: int,
     col: int,
@@ -492,7 +547,14 @@ def _build_detection(
 ) -> TrapDetection:
     """從一個核心向 e2 正反方向積分並建立可序列化的檢出模型。"""
 
-    core_xy = (float(grid.x_axis_m[col]), float(grid.y_axis_m[row]))
+    core_grid_xy = (float(grid.x_axis_m[col]), float(grid.y_axis_m[row]))
+    core_xy = core_grid_xy
+    core_refined = False
+    if config.core_subgrid_refine:
+        refined_xy = refine_core_quadratic(s1, derivative_valid, grid, row, col)
+        if refined_xy is not None:
+            core_xy = refined_xy
+            core_refined = True
     core_s1 = float(s1[row, col])
     forward = _integrate_branch(
         core_xy,
@@ -548,6 +610,8 @@ def _build_detection(
         backward_stop_reason=backward.stop_reason,
         is_qualified=is_qualified,
         qc_flags=tuple(qc_flags),
+        core_grid_xy_m=core_grid_xy,
+        core_refined=core_refined,
     )
 
 

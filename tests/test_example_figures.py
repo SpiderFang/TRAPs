@@ -42,23 +42,87 @@ def test_select_representative_track_rules() -> None:
     assert agg.select_representative_track([], 24.0) == (None, "no_candidate")
 
 
-def test_propagation_centred_differences_exact_on_constant_drift() -> None:
+def test_fit_track_velocity_exact_on_constant_drift() -> None:
     times = np.arange(6, dtype=np.int64) * HOUR_NS
     x = 1000.0 * np.arange(6)  # 1 km/h 東向 = 24 km/day
     y = -500.0 * np.arange(6)  # 0.5 km/h 南向 = -12 km/day
-    index, cx, cy = agg.propagation_velocity_kmday(times, x, y)
-    assert index.tolist() == [1, 2, 3, 4]  # 排除首末
-    assert np.allclose(cx, 24.0) and np.allclose(cy, -12.0)
-    assert agg.propagation_velocity_kmday(times[:2], x[:2], y[:2])[0].size == 0
+    fit = agg.fit_track_velocity(times, x, y)
+    assert fit is not None
+    assert fit.cx_kmday == pytest.approx(24.0) and fit.cy_kmday == pytest.approx(-12.0)
+    assert fit.resid_rms_m == pytest.approx(0.0, abs=1e-9)
+    assert fit.displacement_m == pytest.approx(np.hypot(1000.0, 500.0) * 5)  # 擬合速度 × 觀測時間跨度
+    assert fit.n_obs == 6
+    assert agg.fit_track_velocity(times[:1], x[:1], y[:1]) is None
+    assert agg.fit_track_velocity(np.zeros(3, dtype=np.int64), x[:3], y[:3]) is None  # 時間跨度為零
 
 
-def test_propagation_uses_actual_time_difference_across_gap() -> None:
-    times = np.array([0, HOUR_NS, 3 * HOUR_NS], dtype=np.int64)
-    _, cx, _ = agg.propagation_velocity_kmday(times, np.array([0.0, 1000.0, 3000.0]), np.zeros(3))
-    assert cx[0] == pytest.approx(3000.0 / (3 * 3600.0) * 86.4)
+def test_fit_track_velocity_robust_to_half_cell_jitter_and_uses_actual_time() -> None:
+    """位置抖動 ≤ 半格（500 m，格距 1 km）時，整條 track 的擬合速度仍逼近真值；殘差 RMS 反映抖動量。"""
+
+    hours = np.arange(48)
+    times = hours.astype(np.int64) * HOUR_NS
+    jitter = 400.0 * np.where(hours % 2 == 0, 1.0, -1.0)
+    x = 125.0 * hours + jitter  # 3 km/day
+    y = -50.0 * hours - jitter
+    fit = agg.fit_track_velocity(times, x, y)
+    assert fit.cx_kmday == pytest.approx(3.0, rel=0.03) and fit.cy_kmday == pytest.approx(-1.2, rel=0.03)
+    assert 300.0 < fit.resid_rms_m < 600.0
+    # 跨時間缺口：用實際 UTC 差而不是觀測序號
+    gap_times = np.array([0, 1, 3], dtype=np.int64) * HOUR_NS
+    gap_fit = agg.fit_track_velocity(gap_times, np.array([0.0, 1000.0, 3000.0]), np.zeros(3))
+    assert gap_fit.cx_kmday == pytest.approx(1000.0 / 3600.0 * 86.4)
 
 
-def test_distinct_track_count_and_propagation_columns() -> None:
+def test_stationary_classification_and_propagation_columns() -> None:
+    """擬合位移 < 1 格為靜止：只有移動 track 進入速度統計；靜止比例與殘差 RMS 另列。"""
+
+    shape = (3, 3)
+    grid = {"shape": shape, "x_m_axis": np.array([0.0, 1000.0, 2000.0]), "y_m_axis": np.array([0.0, 1000.0, 2000.0])}
+    site = np.ones(shape, dtype=bool)
+    t0 = 1_704_100_000_000_000_000
+    hours = np.arange(6)
+    # track 1：只有 ±100 m 抖動（靜止）；track 2：東向 100 m/h（600 m/day... 5 h 位移 500 m 仍靜止）；track 3：東向 400 m/h（位移 2 km 移動）
+    observations = {
+        "track_id": np.repeat([1, 2, 3], 6).astype(np.int64),
+        "time_utc_ns": np.tile(hours, 3).astype(np.int64) * HOUR_NS + t0,
+        "core_x_m": np.concatenate([1000.0 + 100.0 * (-1.0) ** hours, 100.0 * hours, 400.0 * hours]),
+        "core_y_m": np.concatenate([np.full(6, 1000.0), np.full(6, 500.0), np.full(6, 700.0)]),
+        "core_s1_sinv": np.full(18, -1e-5),
+    }
+    tracks = {i: {"left_censored": False, "right_censored": False, "lifetime_hours": 6.0, "start_time_utc_ns": t0} for i in (1, 2, 3)}
+    acc: dict = defaultdict(agg._new_site_accumulator)
+    agg._process_track_lifetimes(
+        context={"observations": observations, "tracks_by_id": tracks}, site_masks_2d={"s": site}, grid=grid,
+        site_accumulators=acc, spatial_accumulators={"s": {}},
+    )
+    fitted = np.asarray(acc[("s", "all")]["prop_tracks"])
+    assert fitted.shape == (3, 5) and fitted[:, 4].tolist() == [1.0, 1.0, 0.0]
+    record = agg._finalize_site_record(
+        "s", "all", acc[("s", "all")], site_area_km2=1.0, site_name_zh="s", strong_threshold_sinv=None, hotspot_metrics={},
+        bootstrap_reps=5, rng=np.random.default_rng(0),
+    )
+    assert record["prop_n_tracks"] == 3 and record["prop_n_moving"] == 1 and record["prop_n_stationary"] == 2
+    assert record["prop_stationary_frac"] == pytest.approx(2 / 3)
+    assert record["prop_cx_median_kmday"] == pytest.approx(400.0 * 24.0 / 1000.0)  # 只含移動 track
+    assert record["prop_speed_median_kmday"] == pytest.approx(9.6) and record["prop_speed_p90_kmday"] == pytest.approx(9.6)
+    assert record["prop_resid_rms_median_m"] is not None
+    other = agg._finalize_site_record(
+        "s", "DJF", acc[("s", "DJF")], site_area_km2=1.0, site_name_zh="s", strong_threshold_sinv=None, hotspot_metrics={},
+        bootstrap_reps=5, rng=np.random.default_rng(0),
+    )
+    assert other["prop_n_tracks"] is None and other["prop_stationary_frac"] is None
+    assert set(agg.PROPAGATION_COLUMNS) <= set(agg.SITE_STAT_FIELDNAMES) and "prop_n" not in agg.SITE_STAT_FIELDNAMES
+
+    # 觀測數不足 max(3, --prop-min-obs) 的 track 不擬合
+    acc2: dict = defaultdict(agg._new_site_accumulator)
+    agg._process_track_lifetimes(
+        context={"observations": observations, "tracks_by_id": tracks}, site_masks_2d={"s": site}, grid=grid,
+        site_accumulators=acc2, spatial_accumulators={"s": {}}, prop_min_obs=7,
+    )
+    assert acc2[("s", "all")]["prop_tracks"] == []
+
+
+def test_distinct_track_count_columns() -> None:
     shape = (3, 3)
     grid = {"shape": shape, "x_m_axis": np.array([-1.0, 0.0, 1.0]), "y_m_axis": np.array([-1.0, 0.0, 1.0])}
     site = np.ones(shape, dtype=bool)
@@ -84,19 +148,7 @@ def test_distinct_track_count_and_propagation_columns() -> None:
     stratum = spatial["s"]["DJF"]
     assert stratum["track_count"][1, 1] == 2 and stratum["track_count"][0, 0] == 1
     assert stratum["long_track_count"][1, 1] == 1 and stratum["long_track_count"][0, 0] == 0  # 截尾 track 2 不算長壽命
-    record = agg._finalize_site_record(
-        "s", "all", acc[("s", "all")], site_area_km2=1.0, site_name_zh="s", strong_threshold_sinv=None, hotspot_metrics={},
-        bootstrap_reps=5, rng=np.random.default_rng(0),
-    )
-    assert record["prop_n"] == 2  # 兩條 track 各一個內部觀測
-    assert record["prop_cx_median_kmday"] == pytest.approx(np.median([0.0, 2.0 / 7200.0 * 86.4]))
-    assert record["prop_speed_p90_kmday"] is not None
-    other = agg._finalize_site_record(
-        "s", "DJF", acc[("s", "DJF")], site_area_km2=1.0, site_name_zh="s", strong_threshold_sinv=None, hotspot_metrics={},
-        bootstrap_reps=5, rng=np.random.default_rng(0),
-    )
-    assert other["prop_n"] is None
-    assert set(agg.PROPAGATION_COLUMNS) <= set(agg.SITE_STAT_FIELDNAMES)
+    assert len(acc[("s", "all")]["prop_tracks"]) == 2  # 兩條 track 各一筆擬合
 
 
 def test_verify_recomputed_core_pass_and_failure() -> None:
@@ -117,6 +169,19 @@ def test_pick_later_observations_and_labels() -> None:
     assert example_figures.relative_time_label(6 * 3600.0, day_unit=False) == "+6 h"
     assert example_figures.relative_time_label(3 * 86400.0, day_unit=True) == "+3 天"
     assert example_figures.uses_day_unit(24.0) and not example_figures.uses_day_unit(1.0)
+
+
+def test_rose_histogram_excludes_zero_speed_from_north_bin() -> None:
+    """零速度（atan2(0, 0) 被歸到正北）沒有方向，明確排除，也不進分母。"""
+
+    cx = np.array([0.0, 0.0, 0.0, 10.0, np.nan])
+    cy = np.array([0.0, 0.0, 0.0, 0.0, 1.0])
+    centres, freq, speed = example_figures.rose_histogram(cx, cy)
+    assert freq[0] == 0.0 and np.isnan(speed[0])  # 北扇區沒有被零速度灌水
+    assert freq[4] == pytest.approx(1.0) and speed[4] == pytest.approx(10.0)
+    assert freq.sum() == pytest.approx(1.0)
+    _, empty_freq, empty_speed = example_figures.rose_histogram(np.zeros(4), np.zeros(4))
+    assert empty_freq.sum() == 0.0 and np.all(np.isnan(empty_speed))
 
 
 def test_rose_histogram() -> None:
@@ -149,8 +214,15 @@ def test_aggregate_end_to_end_wp_h(built_run, tmp_path: Path, fake_font) -> None
     with (out / "site_statistics.csv").open(encoding="utf-8", newline="") as stream:
         rows = list(csv.DictReader(stream))
     all_rows = [r for r in rows if r["stratum"] == "all"]
-    assert all(r["prop_n"] != "" for r in all_rows) and all(r["prop_n"] == "" for r in rows if r["stratum"] != "all")
-    assert any(int(r["prop_n"]) > 0 and r["prop_speed_median_kmday"] for r in all_rows)
+    assert all(r["prop_n_tracks"] != "" for r in all_rows) and all(r["prop_n_tracks"] == "" for r in rows if r["stratum"] != "all")
+    assert any(int(r["prop_n_tracks"]) > 0 for r in all_rows)
+    assert all(r["prop_stationary_frac"] != "" for r in all_rows if int(r["prop_n_tracks"]) > 0)
+    assert manifest["coastal_buffer_km"] == 3.0 and manifest["propagation"]["min_observations"] == 3
+    assert manifest["core_subgrid"] == {"method": "quadratic_3x3", "refine": True}
+    for site in ("nanwan", "gongliao", "guishan"):
+        archive = np.load(out / "spatial" / site / "spatial_all.npz")
+        assert {"coast_distance_m", "coast_buffer_mask", "coast_buffer_m"} <= set(archive.files)
+        assert (out / "figures" / site / f"site_{site}_coastal_diagnostic.png").stat().st_size > 1_000
 
     # --no-example-figures：只略過兩張快照圖
     out2 = tmp_path / "agg2"
@@ -242,7 +314,7 @@ def test_wp_h_figures_glyphs_and_no_text_overlap(tmp_path: Path, monkeypatch: py
             plain = re.sub(r"\$[^$]*\$", "", text)
             missing |= {c for c in plain if c not in REQUIRED_FIGURE_GLYPHS and c not in "\n\t"}
     assert not missing, sorted(missing)
-    for key in ("example_title", "method_note_streamline", "propagation_note", "track_pass_note"):
+    for key in ("example_title", "method_note_streamline", "propagation_fit_note", "track_pass_note"):
         assert set(FIGURE_TEXT[key]) <= REQUIRED_FIGURE_GLYPHS
     # 代表圖：圖例文字與註腳文字（及軸標籤）互不重疊
     name, boxes = next(item for item in captured if item[0].endswith("_example.png"))

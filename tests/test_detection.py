@@ -247,3 +247,76 @@ def test_smoothing_scale_above_three_is_rejected() -> None:
 
     with pytest.raises(ValueError, match="0、1、2 或 3"):
         DetectionConfig(smoothing_radius_cells=4)
+
+
+# ---------------------------------------------------------------------------
+# WP-I：次網格核心定位（3x3 二次曲面）
+# ---------------------------------------------------------------------------
+
+
+def _rect_grid(size: int = 9, spacing_m: float = 1000.0):
+    from traps.detection import _RectilinearGrid
+
+    axis = (np.arange(size, dtype=np.float64) - (size - 1) / 2.0) * spacing_m
+    return _RectilinearGrid(axis, axis.copy(), spacing_m, spacing_m), axis
+
+
+def test_quadratic_refinement_recovers_off_node_minimum_below_one_metre() -> None:
+    """解析二次碗（含交叉項）的真實極小值在格點外 0.3/-0.2 格；細化位置誤差 < 1 m。"""
+
+    from traps.detection import refine_core_quadratic
+
+    grid, axis = _rect_grid()
+    xx, yy = np.meshgrid(axis, axis, indexing="xy")
+    x0, y0 = 300.0, -200.0  # 相對格點 (4, 4) 的偏移，單位 m（格距 1000 m）
+    dx, dy = xx - x0, yy - y0
+    s1 = -2.0e-5 + 3.0e-11 * dx**2 + 2.0e-11 * dy**2 + 1.0e-11 * dx * dy
+    valid = np.ones_like(s1, dtype=bool)
+    refined = refine_core_quadratic(s1, valid, grid, 4, 4)
+    assert refined is not None
+    assert np.hypot(refined[0] - x0, refined[1] - y0) < 1.0
+
+
+def test_quadratic_refinement_falls_back_for_saddle_flat_and_far_offset() -> None:
+    """鞍點、Hessian 非正定、偏移超過 0.5 格、stencil 含無效格點時保留格點節點（回傳 None）。"""
+
+    from traps.detection import refine_core_quadratic
+
+    grid, axis = _rect_grid()
+    xx, yy = np.meshgrid(axis, axis, indexing="xy")
+    valid = np.ones(xx.shape, dtype=bool)
+    saddle = 1.0e-11 * (xx**2 - yy**2)
+    assert refine_core_quadratic(saddle, valid, grid, 4, 4) is None
+    linear = 1.0e-9 * xx + 2.0e-9 * yy
+    assert refine_core_quadratic(linear, valid, grid, 4, 4) is None  # Hessian 為零
+    far = 1.0e-11 * ((xx - 900.0) ** 2 + yy**2)  # 極小值在 0.9 格外
+    assert refine_core_quadratic(far, valid, grid, 4, 4) is None
+    bowl = 1.0e-11 * (xx**2 + yy**2)
+    invalid = valid.copy()
+    invalid[3, 4] = False
+    assert refine_core_quadratic(bowl, invalid, grid, 4, 4) is None
+    assert refine_core_quadratic(bowl, valid, grid, 0, 4) is None  # 邊界沒有完整 3x3
+
+
+def test_detection_records_refined_core_off_node_and_toggle() -> None:
+    """局地吸引場中心在格點外：細化核心比格點節點更接近真實中心，並可用旗標關閉。"""
+
+    x, y = _grid(size=41, spacing_m=100.0)
+    x0, y0 = 30.0, -20.0
+    envelope = np.exp(-((x - x0) ** 2 + (y - y0) ** 2) / 900.0**2)
+    u = -2.0e-3 * (x - x0) * envelope
+    v = -1.0e-3 * (y - y0) * envelope
+    valid = np.ones_like(x, dtype=bool)
+    on = detect_snapshot(u, v, valid, x, y, _config(max_curve_length_m=1_200.0))
+    off = detect_snapshot(u, v, valid, x, y, _config(max_curve_length_m=1_200.0, core_subgrid_refine=False))
+    core = min(on.detections, key=lambda d: abs(d.core_grid_xy_m[0]) + abs(d.core_grid_xy_m[1]))
+    node = min(off.detections, key=lambda d: abs(d.core_xy_m[0]) + abs(d.core_xy_m[1]))
+    assert core.core_index_ij == node.core_index_ij == (20, 20)
+    assert core.core_refined and core.core_grid_xy_m == (0.0, 0.0)
+    assert not node.core_refined and node.core_xy_m == node.core_grid_xy_m == (0.0, 0.0)
+    assert abs(core.core_xy_m[0]) <= 50.0 and abs(core.core_xy_m[1]) <= 50.0
+    assert np.hypot(core.core_xy_m[0] - x0, core.core_xy_m[1] - y0) < np.hypot(x0, y0) / 3.0
+    assert any(np.allclose(point, core.core_xy_m) for point in core.curve_points_m)  # 曲線從細化位置起算
+    assert on.config.to_manifest_dict()["core_subgrid"] == "quadratic_3x3"
+    assert on.config.to_manifest_dict()["core_subgrid_refine"] is True
+    assert off.config.to_manifest_dict()["core_subgrid_refine"] is False

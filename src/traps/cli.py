@@ -391,6 +391,7 @@ def _make_config(args: argparse.Namespace, radius: int, threshold: float) -> Det
         min_curve_points=int(args.min_curve_points),
         min_curve_length_m=float(args.min_curve_length_m),
         smoothing_radius_cells=radius,
+        core_subgrid_refine=not bool(getattr(args, "no_core_subgrid_refine", False)),
     )
 
 
@@ -1822,6 +1823,11 @@ def _add_detection_arguments(parser: argparse.ArgumentParser) -> None:
 
     parser.add_argument("--sensitivity", action="store_true", help="執行 0/1/2/3 格 × 兩組核心門檻")
     parser.add_argument("--smoothing-radius-cells", "--smoothing-radius", type=int, action="append", help="可重複指定 0、1、2 或 3")
+    parser.add_argument(
+        "--no-core-subgrid-refine",
+        action="store_true",
+        help="關閉 3x3 二次曲面次網格核心定位（核心退回格點節點；預設開啟）",
+    )
     parser.add_argument("--core-thresholds-sinv", "--thresholds-sinv", nargs=2, type=float, help="兩組負核心 s1 門檻")
     parser.add_argument("--min-core-s1-sinv", type=float, help="單一負核心 s1 門檻（非 sensitivity）")
     parser.add_argument("--min-eigenvalue-gap-sinv", type=float, default=1.0e-12)

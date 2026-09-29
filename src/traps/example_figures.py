@@ -9,7 +9,10 @@
   (a) s1 與 TRAP、(b) 瞬時流線與 TRAP、(c) 水平散度與 TRAP；
 - ``site_<id>_long_tracks.png``（Kunz Fig. 4b 風格）：長壽命 track 的核心路徑，以壽命著色；
 - ``site_<id>_track_density.png``（Kunz Fig. 4c 風格）：通過各格的不同 track 數；
-- ``site_<id>_propagation.png``（Kunz Fig. 5c 類比）：核心傳播速度分量直方圖與方向玫瑰圖。
+- ``site_<id>_propagation.png``（Kunz Fig. 5c 類比）：逐 track 線性擬合傳播速度（位移小於 1 格者為靜止，
+  不入直方圖與方向玫瑰）；標示移動／靜止條數、靜止比例與殘差 RMS；
+- ``site_<id>_example_coastal.png``（WP-I）：代表 track 退回近岸型時另列的近岸型代表；
+  ``site_<id>_long_tracks.png`` 以虛線畫近岸型、實線畫近岸外，所有地圖疊加近岸緩衝帶輪廓。
 
 前兩張需重開 OCM 月份並以該 shard 的偵測設定重算單一 snapshot（:func:`prepare_example_snapshot`）：來源路徑
 與海岸遮罩 sidecar 取自 shard manifest 的來源 provenance，並核對 SHA-256；重算的代表核心必須與 shard 已存核心
@@ -38,6 +41,7 @@ from .aggregate_figures import (
     S1_DAY_LABEL,
     SiteFigureData,
     _add_inch_axes,
+    _draw_coast_buffer,
     _fit_panel,
     _footer,
     _footer_height_inch,
@@ -46,6 +50,7 @@ from .aggregate_figures import (
     _prepare_map_axis,
     _save,
     _view_extent,
+    coast_buffer_label,
     map_data_aspect,
 )
 from .colorbar_layout import align_colorbars_to_axes
@@ -111,6 +116,12 @@ class ExampleSnapshot:
     later: list[LaterObservation] = field(default_factory=list)
     source_month_dir: str = ""
     """實際重開的 OCM 月份目錄（寫入 manifest）。"""
+    is_coastal: bool = False
+    """代表 track 是否為近岸型（平均核心距岸小於緩衝帶）。"""
+    mean_coast_m: float | None = None
+    """代表 track 全部觀測的平均核心距岸距離（m）；沒有近岸資訊時為 ``None``。"""
+    variant: str = "main"
+    """``main``（一般代表圖）或 ``coastal``（近岸型代表圖，標題不同）。"""
 
 
 @dataclass
@@ -129,6 +140,16 @@ class TrackFigureInputs:
     nominal_step_hours: float
     null_long_mean: float | None = None
     null_n_seeds: int = 0
+    long_coastal: Sequence[bool] = ()
+    """與 ``long_tracks`` 平行：該 track 是否近岸型（平均核心距岸小於緩衝帶）；空表示沒有近岸資訊。"""
+    n_long_coastal_total: int | None = None
+    n_long_offshore_total: int | None = None
+    null_long_coastal_mean: float | None = None
+    null_long_offshore_mean: float | None = None
+    prop_stationary: np.ndarray | None = None
+    """與 ``prop_cx_kmday`` 平行；True 為靜止 track（擬合位移小於 1 格）。``None`` 表示全部視為移動。"""
+    prop_resid_rms_m: np.ndarray | None = None
+    """每條已擬合 track 的位置殘差 RMS（m）。"""
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +344,8 @@ def prepare_example_snapshot(
     track_id: int,
     lifetime_hours: float,
     criterion: str,
+    coast_buffer_m: float | None = None,
+    variant: str = "main",
 ) -> ExampleSnapshot:
     """重開代表 track 起始月份、重算起始 snapshot 並核對核心，組成 :class:`ExampleSnapshot`。
 
@@ -387,6 +410,13 @@ def prepare_example_snapshot(
             )
         )
 
+    mean_coast_m: float | None = None
+    if "core_coast_distance_m" in observations:
+        coast_values = np.asarray(observations["core_coast_distance_m"][start:stop], dtype=np.float64)
+        if np.any(np.isfinite(coast_values)):
+            mean_coast_m = float(np.nanmean(coast_values))
+    is_coastal = bool(coast_buffer_m is not None and mean_coast_m is not None and mean_coast_m < float(coast_buffer_m))
+
     chosen = result.detections[int(detections[0])]
     curves = [np.asarray(item.curve_points_m, dtype=np.float64) for item in result.detections if item.is_qualified]
     return ExampleSnapshot(
@@ -413,6 +443,9 @@ def prepare_example_snapshot(
         path_m=np.column_stack([core_x, core_y]),
         later=later,
         source_month_dir=str(month_dir),
+        is_coastal=is_coastal,
+        mean_coast_m=mean_coast_m,
+        variant=variant,
     )
 
 
@@ -508,6 +541,26 @@ def _single_map_layout(
 # ---------------------------------------------------------------------------
 
 
+_CRITERION_RULE_KEYS = {
+    "offshore_exceeds_null": "example_rule_offshore",
+    "offshore_longest": "example_rule_offshore_nonull",
+    "fallback_coastal": "example_rule_fallback_coast",
+    "fallback_offshore_below_null": "example_rule_fallback_coast",
+    "coastal_longest": "example_rule_coastal",
+}
+"""WP-I 代表 track 選取準則對應的圖面規則文字 key。"""
+
+
+def _example_tag(snap: ExampleSnapshot) -> str:
+    """代表圖副標題的明確註記：近岸型，或壽命未超過隨機對照 p99 的整體最長者。"""
+
+    if snap.is_coastal:
+        return T["coastal_tag"]
+    if snap.criterion == "fallback_offshore_below_null":
+        return T["below_null_tag"]
+    return ""
+
+
 def _example_footer(base_footer: str, snap: ExampleSnapshot | None, *, day_unit: bool) -> str:
     if snap is None:
         return base_footer
@@ -516,10 +569,40 @@ def _example_footer(base_footer: str, snap: ExampleSnapshot | None, *, day_unit:
         rule += f"（{T['example_rule_threshold']}）"
     elif snap.criterion == "longest_available":
         rule += f"（{T['example_rule_fallback']}）"
+    elif snap.criterion in _CRITERION_RULE_KEYS:
+        rule = T[_CRITERION_RULE_KEYS[snap.criterion]]
+    coast_text = ""
+    if snap.mean_coast_m is not None:
+        coast_text = f"  {T['coast_dist_xlabel'].split(' (')[0]} {snap.mean_coast_m / 1000.0:.1f} km"
     return (
         f"{base_footer}\ntrack {snap.track_id}  {T['example_birth']} {time_label_utc(snap.time_utc_ns)} UTC  "
-        f"{T['example_lifetime']} {duration_text(snap.lifetime_hours, day_unit=day_unit)}  {snap.n_observations} {T['example_observations']}\n{rule}"
+        f"{T['example_lifetime']} {duration_text(snap.lifetime_hours, day_unit=day_unit)}  {snap.n_observations} {T['example_observations']}"
+        f"{coast_text}\n{rule}\n{T['refined_core_note']}"
     )
+
+
+LABEL_MIN_SEPARATION_INCH = 0.55
+"""後續核心的圖面距離小於此值（英吋）時，相對時間標籤會彼此重疊，改以圖例清單列出。"""
+
+
+def _later_labels_overlap(snap: ExampleSnapshot, data: SiteFigureData, view: tuple[slice, slice], panel_w: float, panel_h: float) -> bool:
+    """後續核心（含起始核心）在圖面上是否有任兩點距離小於 :data:`LABEL_MIN_SEPARATION_INCH`。"""
+
+    if not snap.later:
+        return False
+    rows, cols = view
+    lon, lat = data.lon[cols], data.lat[rows]
+    mapper = MetricToLonLat(snap.x_m_axis, snap.y_m_axis, data.lon, data.lat)
+    points_m = np.asarray([snap.chosen_core_m, *[item.core_m for item in snap.later]], dtype=np.float64)
+    lon_p, lat_p = mapper(points_m[:, 0], points_m[:, 1])
+    lon_span = max(float(lon.max() - lon.min()), 1.0e-12)
+    lat_span = max(float(lat.max() - lat.min()), 1.0e-12)
+    xy = np.column_stack([(lon_p - lon.min()) / lon_span * panel_w, (lat_p - lat.min()) / lat_span * panel_h])
+    for first in range(1, xy.shape[0]):
+        for second in range(0, first):
+            if float(np.hypot(*(xy[first] - xy[second]))) < LABEL_MIN_SEPARATION_INCH:
+                return True
+    return False
 
 
 def render_example(
@@ -547,6 +630,10 @@ def render_example(
     lon, lat = data.lon[cols], data.lat[rows]
     full_footer = _example_footer(footer, snap, day_unit=day_unit)
     layout = _single_map_layout(data, view, full_footer, legend_height=0.62)
+    # 後續核心幾乎沒有移動時，地圖上的相對時間標籤會彼此重疊：改為圖例中的位移清單。
+    list_labels = snap is not None and _later_labels_overlap(snap, data, view, layout["panel_w"], layout["panel_h"])
+    if list_labels:
+        layout = _single_map_layout(data, view, full_footer, legend_height=0.86)
     figure = plt.figure(figsize=(layout["fig_w"], layout["fig_h"]))
     axis = _add_inch_axes(figure, layout["x0"], layout["y0"], layout["panel_w"], layout["panel_h"])
     cax = _add_inch_axes(figure, layout["x0"] + layout["panel_w"] + _CBAR_PAD_INCH, layout["y0"], _CBAR_WIDTH_INCH, layout["panel_h"])
@@ -584,17 +671,22 @@ def render_example(
             axis.plot(curve_lon, curve_lat, color=colour, linewidth=1.9, zorder=5.5, path_effects=halo)
             core_lon, core_lat = mapper([later_obs.core_m[0]], [later_obs.core_m[1]])
             axis.plot(core_lon, core_lat, marker="o", markersize=4, color=colour, markeredgecolor="white", markeredgewidth=0.5, zorder=6)
-            axis.annotate(
-                relative_time_label(later_obs.dt_seconds, day_unit=day_unit),
-                xy=(float(core_lon[0]), float(core_lat[0])),
-                xytext=(5, 5),
-                textcoords="offset points",
-                fontsize=8,
-                color="#5f1010",
-                zorder=9,
-                bbox={"boxstyle": "round,pad=0.15", "facecolor": "white", "alpha": 0.75, "edgecolor": "none"},
-            )
-        if snap.later:
+            if list_labels:
+                shift_km = float(np.hypot(later_obs.core_m[0] - snap.chosen_core_m[0], later_obs.core_m[1] - snap.chosen_core_m[1])) / 1000.0
+                handles.append(Line2D([], [], color=colour, linewidth=1.9, marker="o", markersize=4))
+                labels.append(f"{relative_time_label(later_obs.dt_seconds, day_unit=day_unit)}（{T['displacement']} {shift_km:.2f} km）")
+            else:
+                axis.annotate(
+                    relative_time_label(later_obs.dt_seconds, day_unit=day_unit),
+                    xy=(float(core_lon[0]), float(core_lat[0])),
+                    xytext=(5, 5),
+                    textcoords="offset points",
+                    fontsize=8,
+                    color="#5f1010",
+                    zorder=9,
+                    bbox={"boxstyle": "round,pad=0.15", "facecolor": "white", "alpha": 0.75, "edgecolor": "none"},
+                )
+        if snap.later and not list_labels:
             handles.append(Line2D([], [], color=LATER_CURVE_COLOURS[1], linewidth=1.9))
             labels.append(T["example_later_curves"])
 
@@ -610,10 +702,13 @@ def render_example(
         axis.plot(core_lon, core_lat, marker="o", markersize=7.5, color="#c00000", markeredgecolor="white", markeredgewidth=1.0, linestyle="none", zorder=8)
         handles.append(Line2D([], [], color="#c00000", linewidth=3.0, marker="o", markersize=6))
         labels.append(T["example_chosen_curve"])
-        _prepare_map_axis(axis, data, view, coastline)
+        buffer_handle = _prepare_map_axis(axis, data, view, coastline)
+        if buffer_handle is not None:
+            handles.append(buffer_handle)
+            labels.append(coast_buffer_label(data))
         subtitle = (
             f"track {snap.track_id}｜{T['example_birth']} {time_label_utc(snap.time_utc_ns)} UTC｜"
-            f"{T['example_lifetime']} {duration_text(snap.lifetime_hours, day_unit=day_unit)}"
+            f"{T['example_lifetime']} {duration_text(snap.lifetime_hours, day_unit=day_unit)}{_example_tag(snap)}"
         )
 
     align_colorbars_to_axes(figure, ((axis, cax),))
@@ -629,7 +724,8 @@ def render_example(
             columnspacing=1.6,
             handlelength=2.2,
         )
-    _sequence_title(figure, layout["fig_w"], layout["fig_h"], f"{data.site_name_zh} — {T['example_title']}", subtitle)
+    title_key = "coastal_example_title" if (snap is not None and snap.variant == "coastal") else "example_title"
+    _sequence_title(figure, layout["fig_w"], layout["fig_h"], f"{data.site_name_zh} — {T[title_key]}", subtitle)
     _place_footer(figure, full_footer)
     _save(figure, plt, output_path, dpi)
     return output_path
@@ -698,6 +794,7 @@ def render_method_comparison(
         _add_inch_axes(figure, positions[2] + panel_w + _CBAR_PAD_INCH, y0, _CBAR_WIDTH_INCH, panel_h),
     ]
     pairs: list[tuple[Any, Any]] = []
+    buffer_handles: list[Any] = []
     titles = (T["method_panel_a"], T["method_panel_b"], T["method_panel_c"])
     subtitle: str | None = None
 
@@ -753,12 +850,14 @@ def render_method_comparison(
                 cores = np.asarray(snap.cores_m, dtype=np.float64)
                 core_lon, core_lat = mapper(cores[:, 0], cores[:, 1])
                 axis.scatter(core_lon, core_lat, s=14, color="#e31a1c", edgecolor="white", linewidth=0.4, zorder=6)
-            _prepare_map_axis(axis, data, view, coastline)
+            buffer_handle = _prepare_map_axis(axis, data, view, coastline)
+            if buffer_handle is not None:
+                buffer_handles.append(buffer_handle)
         for axis, title in zip(axes, titles, strict=True):
             axis.set_title(title, fontsize=10)
         axes[0].plot([], [], color="#111111", linewidth=1.3, label=T["trap_curve"])
         axes[0].plot([], [], marker="o", markersize=4, color="#e31a1c", linestyle="none", label=T["trap_core"])
-        axes[0].legend(loc="lower right", fontsize=7)
+        axes[0].legend(handles=[*axes[0].get_legend_handles_labels()[0], *buffer_handles[:1]], loc="lower right", fontsize=7)
 
     align_colorbars_to_axes(figure, tuple(pairs))
     _sequence_title(figure, fig_w, fig_h, f"{data.site_name_zh} — {T['method_title']}", subtitle)
@@ -793,6 +892,16 @@ def render_long_tracks(
         extra_lines.append(f"{T['long_capped_a']} {len(drawn)} {T['long_capped_b']} {n_total} {T['long_capped_c']}")
     if tracks.null_long_mean is not None:
         extra_lines.append(f"{T['null_long_mean']} {tracks.null_long_mean:.1f} {T['n_tracks']}（n_seed={tracks.null_n_seeds}）")
+    if tracks.n_long_coastal_total is not None and tracks.n_long_offshore_total is not None:
+        extra_lines.append(
+            f"{T['long_coast_real']} {int(tracks.n_long_coastal_total)} {T['n_tracks']}，"
+            f"{T['long_coast_offshore']} {int(tracks.n_long_offshore_total)} {T['n_tracks']}"
+        )
+        if tracks.null_long_coastal_mean is not None and tracks.null_long_offshore_mean is not None:
+            extra_lines.append(
+                f"{T['long_coast_null']} {tracks.null_long_coastal_mean:.1f} {T['n_tracks']}，"
+                f"{T['long_coast_offshore']} {tracks.null_long_offshore_mean:.1f} {T['n_tracks']}（n_seed={tracks.null_n_seeds}）"
+            )
     full_footer = footer + "".join(f"\n{line}" for line in extra_lines)
     layout = _single_map_layout(data, view, full_footer, legend_height=0.0, max_width=7.0, max_height=6.0)
     figure = plt.figure(figsize=(layout["fig_w"], layout["fig_h"]))
@@ -805,22 +914,35 @@ def render_long_tracks(
         vmax = vmin + 1.0
     norm = matplotlib.colors.Normalize(vmin=vmin, vmax=vmax)
     cmap = plt.get_cmap("viridis")
+    legend_handles: list[Any] = []
     if drawn:
-        ordered = sorted(drawn, key=lambda item: item[0])
-        segments, colours, starts = [], [], []
-        for lifetime, x_m, y_m in ordered:
+        from matplotlib.lines import Line2D
+
+        coastal_flags = list(tracks.long_coastal) if len(tracks.long_coastal) == len(drawn) else [False] * len(drawn)
+        order = sorted(range(len(drawn)), key=lambda index: drawn[index][0])
+        segments, colours, starts, styles = [], [], [], []
+        for index in order:
+            lifetime, x_m, y_m = drawn[index]
             lon_t, lat_t = mapper(x_m, y_m)
             segments.append(np.column_stack([lon_t, lat_t]))
             colours.append(cmap(norm(lifetime / scale)))
             starts.append((lon_t[0], lat_t[0]))
-        axis.add_collection(LineCollection(segments, colors=colours, linewidths=0.9, alpha=0.9, zorder=4))
+            styles.append((0, (3.0, 2.0)) if coastal_flags[index] else "solid")
+        axis.add_collection(LineCollection(segments, colors=colours, linewidths=0.9, alpha=0.9, zorder=4, linestyles=styles))
         start_array = np.asarray(starts)
         axis.scatter(start_array[:, 0], start_array[:, 1], s=6, color="black", edgecolor="white", linewidth=0.3, zorder=5, label=T["long_tracks_start"])
-        axis.legend(loc="lower right", fontsize=7)
+        legend_handles.extend(axis.get_legend_handles_labels()[0])
+        if any(coastal_flags):
+            legend_handles.append(Line2D([], [], color="0.25", linewidth=1.2, linestyle="-", label=T["offshore_track_legend"]))
+            legend_handles.append(Line2D([], [], color="0.25", linewidth=1.2, linestyle=(0, (3.0, 2.0)), label=T["coastal_locked_legend"]))
     mappable = matplotlib.cm.ScalarMappable(norm=norm, cmap=cmap)
     colorbar = figure.colorbar(mappable, cax=cax)
     colorbar.set_label(T["lifetime_days"] if day_unit else T["lifetime_hours"])
-    _prepare_map_axis(axis, data, view, coastline)
+    buffer_handle = _prepare_map_axis(axis, data, view, coastline)
+    if buffer_handle is not None:
+        legend_handles.append(buffer_handle)
+    if legend_handles:
+        axis.legend(handles=legend_handles, loc="lower right", fontsize=7)
     if not drawn:
         _empty_state(axis, T["no_data"])
     threshold_text = duration_text(tracks.long_track_hours, day_unit=day_unit)
@@ -878,7 +1000,9 @@ def render_track_density(
         colorbar.locator = MaxNLocator(integer=True)
         colorbar.update_ticks()
         axis.set_title(title, fontsize=10)
-        _prepare_map_axis(axis, data, view, coastline)
+        buffer_handle = _prepare_map_axis(axis, data, view, coastline)
+        if buffer_handle is not None:
+            axis.legend(handles=[buffer_handle], loc="lower right", fontsize=7)
         pairs.append((axis, cax))
     align_colorbars_to_axes(figure, tuple(pairs))
     _sequence_title(figure, fig_w, fig_h, f"{data.site_name_zh} — {T['track_density_title']}", None)
@@ -896,11 +1020,14 @@ def rose_histogram(cx_kmday: np.ndarray, cy_kmday: np.ndarray, sectors: int = RO
     """去向玫瑰圖統計：回傳 (扇區中心方位角度（自北順時針）, 各扇區頻率, 各扇區平均速率)。
 
     方位角 = ``atan2(cx, cy)``（0° 北、90° 東）；扇區以正北為中心對稱切分。平均速率為該扇區
-    ``hypot(cx, cy)`` 的平均，空扇區為 NaN；頻率總和為 1（無樣本時全為 0）。
+    ``hypot(cx, cy)`` 的平均，空扇區為 NaN；頻率總和為 1（無樣本時全為 0）。速率為零（或非有限）的樣本
+    沒有方向（``atan2(0, 0)`` 會被誤歸到正北），因此明確排除，不計入任何扇區與分母。
     """
 
     cx = np.asarray(cx_kmday, dtype=np.float64)
     cy = np.asarray(cy_kmday, dtype=np.float64)
+    moving = np.isfinite(cx) & np.isfinite(cy) & (np.hypot(cx, cy) > 0.0)
+    cx, cy = cx[moving], cy[moving]
     width = 360.0 / sectors
     centres = np.arange(sectors) * width
     frequency = np.zeros(sectors)
@@ -920,16 +1047,33 @@ def rose_histogram(cx_kmday: np.ndarray, cy_kmday: np.ndarray, sectors: int = RO
 def render_propagation(
     output_path: Path, data: SiteFigureData, tracks: TrackFigureInputs, *, footer: str, dpi: int = 150
 ) -> Path:
-    """核心傳播速度：cx、cy 直方圖（含中位數線與 n）與 16 扇區去向玫瑰圖（依平均速率著色）。"""
+    """核心傳播速度：每條 track 的線性擬合速度分量直方圖（含中位數線）與去向玫瑰圖，只含移動 track。
+
+    速度來自每條 track 核心位置 ``x(t)、y(t)`` 的最小平方線性擬合（至少 3 個觀測）；擬合位移小於 1 格的
+    track 視為靜止，不進入直方圖與玫瑰圖（零速度沒有方向），但在副標題明確標示移動／靜止條數與靜止比例，
+    註腳附殘差 RMS 中位數。
+    """
 
     matplotlib, plt = _load_matplotlib()
-    cx = np.asarray(tracks.prop_cx_kmday, dtype=np.float64)
-    cy = np.asarray(tracks.prop_cy_kmday, dtype=np.float64)
-    n = int(cx.size)
-    full_footer = (
-        f"{footer}\n{T['propagation_samples']} n={n}（{int(tracks.prop_track_n)} {T['propagation_tracks']}）  "
-        f"{T['propagation_note']}"
+    all_cx = np.asarray(tracks.prop_cx_kmday, dtype=np.float64)
+    all_cy = np.asarray(tracks.prop_cy_kmday, dtype=np.float64)
+    stationary = (
+        np.asarray(tracks.prop_stationary, dtype=bool) if tracks.prop_stationary is not None else np.zeros(all_cx.shape, dtype=bool)
     )
+    cx, cy = all_cx[~stationary], all_cy[~stationary]
+    n = int(cx.size)
+    n_stationary = int(stationary.sum())
+    n_fitted = int(all_cx.size)
+    stationary_fraction = (n_stationary / n_fitted) if n_fitted else float("nan")
+    subtitle = (
+        f"{T['propagation_moving']} {n}／{T['propagation_stationary']} {n_stationary}"
+        + (f"（{T['propagation_stationary_frac']} {100.0 * stationary_fraction:.0f}%）" if n_fitted else "")
+        + f"｜{T['propagation_stationary_def']}"
+    )
+    resid_text = ""
+    if tracks.prop_resid_rms_m is not None and np.size(tracks.prop_resid_rms_m):
+        resid_text = f"  {T['propagation_resid']} {float(np.median(tracks.prop_resid_rms_m)):.0f} {T['unit_m']}"
+    full_footer = f"{footer}\n{T['propagation_fitted']} {n_fitted} {T['propagation_tracks']}{resid_text}\n{T['propagation_fit_note']}"
     footer_h = _footer_height_inch(full_footer)
     hist_w, hist_h = 3.5, 3.1
     rose_size = 3.1
@@ -991,7 +1135,7 @@ def render_propagation(
         ax_rose.text(0.5, 0.5, T["no_data"], transform=ax_rose.transAxes, ha="center", va="center", color="#7f0000")
     ax_rose.set_ylabel("")
     align_colorbars_to_axes(figure, ((ax_rose, cax),))
-    _sequence_title(figure, fig_w, fig_h, f"{data.site_name_zh} — {T['propagation_title']}", None)
+    _sequence_title(figure, fig_w, fig_h, f"{data.site_name_zh} — {T['propagation_title']}", subtitle)
     _place_footer(figure, full_footer)
     _save(figure, plt, output_path, dpi)
     return output_path
@@ -1038,6 +1182,34 @@ def render_snapshot_figures(
     return [f"figures/{data.site_id}/{stem}_{kind}.png" for kind in EXAMPLE_FIGURE_KINDS]
 
 
+def render_coastal_example(
+    output_dir: Path,
+    data: SiteFigureData,
+    snap: ExampleSnapshot | None,
+    *,
+    font_selection: CJKFontSelection | None,
+    coastline: CoastlineGeometry | None,
+    state_label: str,
+    param_id: str,
+    period_label: str,
+    nominal_step_hours: float = 1.0,
+    dpi: int = 150,
+) -> list[str]:
+    """輸出 ``site_<id>_example_coastal.png``（最長近岸型 track 的代表圖）；沒有近岸型 track（``snap`` 為 ``None``）時不輸出。"""
+
+    if snap is None:
+        return []
+    font = _require_font(font_selection)
+    footer = _shared_footer(data, font, state_label, param_id, period_label)
+    site_dir = output_dir / "figures" / data.site_id
+    with cjk_font_context(font):
+        render_example(
+            site_dir / f"site_{data.site_id}_example_coastal.png", data, snap, coastline=coastline, footer=footer,
+            day_unit=uses_day_unit(nominal_step_hours), dpi=dpi,
+        )
+    return [f"figures/{data.site_id}/site_{data.site_id}_example_coastal.png"]
+
+
 def render_track_figures(
     output_dir: Path,
     data: SiteFigureData,
@@ -1073,6 +1245,7 @@ __all__ = [
     "pick_later_observations",
     "prepare_example_snapshot",
     "relative_time_label",
+    "render_coastal_example",
     "render_snapshot_figures",
     "render_track_figures",
     "resolve_source_paths",

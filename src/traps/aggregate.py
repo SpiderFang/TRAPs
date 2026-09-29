@@ -3,7 +3,7 @@
 Stage 1（``detect-shards``）與 Stage 2（``track-period``）分別把單一 domain-month
 的逐時檢出、以及一個 domain 全期的跨月份 track 寫成可續跑、可驗證的 shard／track
 artifact。本模組是第三階段：讀入已完成的 track-root（`traps.period.track.v1`）與
-detect-root（`traps.period.shard.v1`），核對已載入 domain 共用同一組 `param_id`、
+detect-root（`traps.period.shard.v2`，仍可讀 v1：缺少的核心距岸距離由海域遮罩補算），核對已載入 domain 共用同一組 `param_id`、
 `detection_config`、`tracking_config`、`min_coverage`、`state_label`，再以
 :func:`traps.sites.site_masks`（沿用四區 flow-domain 分割定義）取得每個研究站的
 「站點分析區」（``site_area``）：B／C／D 是整個 flow domain 的分析海域，A 區則依
@@ -38,13 +38,14 @@ import time as _time
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 
 from .cli import _resolve_coastline_geojson, _sha256_file
 from .period import (
-    SHARD_SCHEMA_VERSION,
+    ACCEPTED_SHARD_SCHEMA_VERSIONS,
+    COAST_DISTANCE_CAP_M,
     TRACK_SCHEMA_VERSION,
     _artifact_records,
     _atomic_write_json,
@@ -59,6 +60,8 @@ from .period import (
     _canonical_valid_snapshot_indices_by_month,
     _site_core_s1_for_month as _period_site_core_s1_for_month,
     _thresholds_from_core_values,
+    compute_coast_distance_field,
+    sample_coast_distance,
 )
 from .sites import DEFAULT_STUDY_DESIGN_PATH, load_study_design, site_masks
 
@@ -82,6 +85,8 @@ EXAMPLE_FIGURE_KINDS = ("example", "method_comparison")
 """需重開 OCM snapshot 的圖（``--no-example-figures`` 略過）。"""
 TRACK_FIGURE_KINDS = ("long_tracks", "track_density", "propagation")
 """只用 track／spatial 產物的圖。"""
+COASTAL_FIGURE_KINDS = ("example_coastal", "coastal_diagnostic")
+"""WP-I 近岸診斷圖：近岸型代表 track（需重開 OCM，可能不存在）與近岸診斷統計圖。"""
 COLOUR_FIELDS = ("curve_pass_frequency", "core_frequency", "mean_core_s1_day", "mean_lifetime_hours")
 """逐站色階上下限的四個逐格欄位。"""
 LIFETIME_THRESHOLD_HOURS = (6.0, 12.0, 24.0)
@@ -89,6 +94,12 @@ LIFETIME_THRESHOLD_HOURS = (6.0, 12.0, 24.0)
 HOTSPOT_MIN_CELLS = 3
 """``--hotspot-min-cells`` 的預設值：圖面熱點連通塊最少格數（只影響圖面，不影響統計）。"""
 SECONDS_PER_DAY = 86_400.0
+COASTAL_BUFFER_KM = 3.0
+"""``--coastal-buffer-km`` 的預設值：近岸緩衝帶寬度（核心距最近非分析海域格點的距離）。"""
+PROP_MIN_OBS = 3
+"""``--prop-min-obs`` 的預設值與下限：傳播速度線性擬合所需的最少觀測數。"""
+COAST_HIST_EDGES_KM = np.linspace(0.0, COAST_DISTANCE_CAP_M / 1000.0, 61)
+"""近岸診斷圖直方圖的固定 bin 邊界（km）；超過距離場飽和上限的值落入最後一格。"""
 
 _KNOWN_TOP_LEVEL_NAMES = ("site_statistics.csv", "site_statistics.json", "manifest.json", "manifest.sha256", "_SUCCESS")
 
@@ -206,7 +217,10 @@ def _verify_shard_manifests(
         manifest = _success_verified(shard_dir)
         _require(manifest is not None, f"detect-root shard 未完成或驗證失敗: {shard_dir}")
         assert manifest is not None
-        _require(manifest.get("schema_version") == SHARD_SCHEMA_VERSION, f"{shard_dir} schema_version 不符")
+        _require(
+            manifest.get("schema_version") in ACCEPTED_SHARD_SCHEMA_VERSIONS,
+            f"{shard_dir} schema_version 不受支援（需要 {ACCEPTED_SHARD_SCHEMA_VERSIONS}）",
+        )
         expected_sha256 = recorded_sha256.get(month)
         _require(expected_sha256 is not None, f"track-period manifest 沒有記錄 {domain_id}/{month} 的 shard manifest")
         actual_sha256 = _sha256_file(shard_dir / "manifest.json")
@@ -306,6 +320,10 @@ def _load_domain_grid(detect_root: Path, domain_id: str, first_month: str) -> di
     shape = (int(lat.size), int(lon.size))
     _require(grid["analysis_ocean_mask"].shape == shape, f"{domain_id} analysis_ocean_mask shape 不符")
     grid["shape"] = shape
+    if "coast_distance_m" not in grid:
+        # v1 shard 沒有近岸距離場：由 analysis_ocean_mask 與座標軸即時計算（與 v2 定義相同）。
+        grid["coast_distance_m"] = compute_coast_distance_field(grid["analysis_ocean_mask"], grid["x_m_axis"], grid["y_m_axis"])
+        grid["coast_distance_computed"] = True
     return grid
 
 
@@ -393,10 +411,21 @@ def _new_site_accumulator() -> dict[str, Any]:
         "track_lifetimes_all": [],
         "age_sum_sinv": np.zeros(LIFETIME_EVOLUTION_AGE_POINTS, dtype=np.float64),
         "age_track_count": 0,
-        "prop_cx_kmday": [],
-        "prop_cy_kmday": [],
-        "prop_track_n": 0,
+        "prop_tracks": [],  # 每條已擬合 track：(cx_kmday, cy_kmday, resid_rms_m, displacement_m, stationary)
         "born_uncensored": [],
+        # --- 近岸診斷（WP-I）---
+        "core_near_count": 0,  # 站內合格核心中，距岸小於緩衝帶者
+        "strong_core_count_total": 0,
+        "strong_core_near_count": 0,
+        "offshore_strong_occurrence": 0,  # 含至少一個近岸外強核心的有效快照數
+        "coast_hist_all": np.zeros(COAST_HIST_EDGES_KM.size - 1, dtype=np.int64),
+        "coast_hist_strong": np.zeros(COAST_HIST_EDGES_KM.size - 1, dtype=np.int64),
+        "coast_hist_long": np.zeros(COAST_HIST_EDGES_KM.size - 1, dtype=np.int64),
+        "track_lifetimes_offshore": [],  # 未截尾 track，平均核心距岸不小於緩衝帶
+        "track_lifetimes_coastal": [],  # 未截尾 track，平均核心距岸小於緩衝帶
+        "long_track_n": 0,  # 站內出生、未截尾、壽命 >= 長壽命門檻
+        "long_track_coastal_n": 0,
+        "coast_info": False,  # 是否有近岸資訊（沒有時上列近岸欄位不輸出）
     }
 
 
@@ -434,12 +463,17 @@ def _process_domain(
     thresholds_sinv: Mapping[str, float | None],
     site_accumulators: dict[tuple[str, str], dict[str, Any]],
     spatial_accumulators: dict[str, dict[str, dict[str, np.ndarray]]],
+    coast_buffer_m: float | None = None,
 ) -> None:
     """流式處理一個 domain 的每個月份 shard，累加各站 site×stratum 與站內逐格空間統計。
 
     每個站只看自己分析區內的核心與曲線通過格點；站的有效快照分母要求該站分析區內
     有效格點比例達 ``min_coverage``。強核心用「該站自己的」門檻。空間累加器只記
     季節與年份分層，``all`` 由季節相加取得，避免每個快照重複累加。
+
+    給定 ``coast_buffer_m`` 時另累加近岸診斷：站內核心／強核心落在近岸緩衝帶內的數量、核心距岸直方圖、
+    含近岸外強核心的快照數（強核心門檻不重算，仍是該站全部核心的分位數）。核心距岸距離優先讀 v2 shard 的
+    ``core_coast_distance_m``；v1 shard 由 ``grid`` 的距離場在核心位置取樣。
     """
 
     shape = grid["shape"]
@@ -473,6 +507,12 @@ def _process_domain(
             det_core_s1 = np.array(archive["core_s1_sinv"])
             det_pass_cell_offsets = np.array(archive["pass_cell_offsets"])
             det_pass_cells = np.array(archive["pass_cells"])
+            if "core_coast_distance_m" in archive.files:
+                det_core_coast = np.array(archive["core_coast_distance_m"])
+            else:
+                det_core_coast = sample_coast_distance(
+                    grid["coast_distance_m"], grid["x_m_axis"], grid["y_m_axis"], np.array(archive["core_x_m"]), np.array(archive["core_y_m"])
+                )
 
         qualified_rows = np.nonzero(det_is_qualified)[0]
         order = np.argsort(det_snapshot_index[qualified_rows], kind="stable")
@@ -495,6 +535,7 @@ def _process_domain(
 
             core_flat = det_core_row[rows].astype(np.int64) * np.int64(nx) + det_core_col[rows].astype(np.int64)
             core_s1 = det_core_s1[rows]
+            core_coast = det_core_coast[rows]
 
             cell_values, _row_out = _ragged_gather(det_pass_cell_offsets, rows, det_pass_cells)
             cells_this_snapshot = np.unique(cell_values.astype(np.int64)) if cell_values.size else np.zeros(0, dtype=np.int64)
@@ -519,6 +560,20 @@ def _process_domain(
                 has_core = site_core_flat.size > 0
                 has_strong = bool(np.any(strong_flags))
                 has_curve = curve_cells_in_mask.size > 0
+                if coast_buffer_m is not None:
+                    site_core_coast = core_coast[core_in_mask]
+                    near = np.isfinite(site_core_coast) & (site_core_coast < coast_buffer_m)
+                    finite_coast = np.isfinite(site_core_coast)
+                    coast_km = np.clip(site_core_coast[finite_coast] / 1000.0, 0.0, COAST_HIST_EDGES_KM[-1] - 1.0e-9)
+                    hist_all = np.histogram(coast_km, bins=COAST_HIST_EDGES_KM)[0]
+                    strong_coast = site_core_coast[strong_flags & finite_coast]
+                    hist_strong = np.histogram(
+                        np.clip(strong_coast / 1000.0, 0.0, COAST_HIST_EDGES_KM[-1] - 1.0e-9), bins=COAST_HIST_EDGES_KM
+                    )[0]
+                    n_near = int(near.sum())
+                    n_strong = int(strong_flags.sum())
+                    n_strong_near = int((strong_flags & near).sum())
+                    has_offshore_strong = bool(np.any(strong_flags & ~near))
 
                 for stratum in strata:
                     accumulator = site_accumulators[(site_id, stratum)]
@@ -532,6 +587,14 @@ def _process_domain(
                     if has_curve:
                         accumulator["curve_occurrence"] += 1
                     accumulator["pass_fraction_sum"] += pass_fraction
+                    if coast_buffer_m is not None:
+                        accumulator["coast_info"] = True
+                        accumulator["core_near_count"] += n_near
+                        accumulator["strong_core_count_total"] += n_strong
+                        accumulator["strong_core_near_count"] += n_strong_near
+                        accumulator["offshore_strong_occurrence"] += int(has_offshore_strong)
+                        accumulator["coast_hist_all"] += hist_all
+                        accumulator["coast_hist_strong"] += hist_strong
 
                     day_row = accumulator["day_stats"][day]
                     day_row[0] += 1
@@ -595,53 +658,146 @@ LONG_TRACK_DRAW_LIMIT = 2000
 """``site_<id>_long_tracks.png`` 最多繪製的 track 數（取壽命最長者）。"""
 
 
-def propagation_velocity_kmday(
-    times_utc_ns: np.ndarray, core_x_m: np.ndarray, core_y_m: np.ndarray
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """以中心差分估計 track 核心的傳播速度（km/day），不含首末觀測。
+class PropagationFit(NamedTuple):
+    """單一 track 核心位置的線性擬合結果。"""
 
-    第 ``i`` 個內部觀測的速度為 ``(p[i+1] - p[i-1]) / (t[i+1] - t[i-1])``，位置為公尺制
-    ``core_x_m``（東向）與 ``core_y_m``（北向），時間差取實際 UTC 差（跨缺口時仍正確）。
-    回傳 ``(內部觀測索引, cx, cy)``；少於 3 個觀測、或前後觀測時間差非正的內部點不回傳。
-    這是模型內 TRAP 核心（結構）的位移速度，不是水體或漂浮物速度。
+    cx_kmday: float
+    cy_kmday: float
+    resid_rms_m: float
+    displacement_m: float
+    n_obs: int
+
+
+def fit_track_velocity(times_utc_ns: np.ndarray, core_x_m: np.ndarray, core_y_m: np.ndarray) -> PropagationFit | None:
+    """以最小平方線性擬合 ``x(t)``、``y(t)`` 估計整條 track 的核心傳播速度（km/day）。
+
+    核心位置為公尺制 ``core_x_m``（東向）與 ``core_y_m``（北向），時間取實際 UTC 差（跨缺口仍正確）。
+    對每個座標個別擬合 ``p(t) = p0 + c (t - t_mean)``，回傳擬合速度 ``(cx, cy)``、位置殘差 RMS
+    （兩座標平方殘差平均後開根號，m）與擬合位移 ``hypot(cx, cy) * (t_last - t_first)``（m）。
+    少於 2 個觀測或時間跨度非正時回傳 ``None``。這是模型內 TRAP 核心（結構）的位移速度，不是水體或漂浮物速度；
+    與單步差分不同，整條 track 的線性擬合對核心位置的次網格抖動不敏感，位移小於 1 格的 track 視為靜止。
     """
 
     times = np.asarray(times_utc_ns, dtype=np.int64)
     x = np.asarray(core_x_m, dtype=np.float64)
     y = np.asarray(core_y_m, dtype=np.float64)
-    if times.size < 3:
-        return np.zeros(0, dtype=np.int64), np.zeros(0), np.zeros(0)
-    dt_seconds = (times[2:] - times[:-2]).astype(np.float64) / 1.0e9
-    ok = dt_seconds > 0.0
-    index = np.arange(1, times.size - 1, dtype=np.int64)[ok]
-    cx = (x[2:] - x[:-2])[ok] / dt_seconds[ok] * M_PER_S_TO_KM_PER_DAY
-    cy = (y[2:] - y[:-2])[ok] / dt_seconds[ok] * M_PER_S_TO_KM_PER_DAY
-    return index, cx, cy
+    if times.size < 2 or x.size != times.size or y.size != times.size:
+        return None
+    seconds = (times - times[0]).astype(np.float64) / 1.0e9
+    centred_t = seconds - float(seconds.mean())
+    denominator = float(np.sum(centred_t * centred_t))
+    span = float(seconds[-1] - seconds[0])
+    if not denominator > 0.0 or not span > 0.0:
+        return None
+    x_centred = x - float(x.mean())
+    y_centred = y - float(y.mean())
+    slope_x = float(np.sum(centred_t * x_centred) / denominator)
+    slope_y = float(np.sum(centred_t * y_centred) / denominator)
+    resid_x = x_centred - slope_x * centred_t
+    resid_y = y_centred - slope_y * centred_t
+    rms = float(np.sqrt(np.mean(resid_x * resid_x + resid_y * resid_y)))
+    return PropagationFit(
+        cx_kmday=slope_x * M_PER_S_TO_KM_PER_DAY,
+        cy_kmday=slope_y * M_PER_S_TO_KM_PER_DAY,
+        resid_rms_m=rms,
+        displacement_m=float(np.hypot(slope_x, slope_y) * span),
+        n_obs=int(times.size),
+    )
+
+
+def grid_cell_size_m(grid: Mapping[str, Any]) -> float:
+    """格點尺寸（m）：x、y 軸中位格距的平均；靜止 track 的位移門檻為一格。"""
+
+    x_axis = np.asarray(grid["x_m_axis"], dtype=np.float64)
+    y_axis = np.asarray(grid["y_m_axis"], dtype=np.float64)
+    steps = [float(np.median(np.abs(np.diff(axis)))) for axis in (x_axis, y_axis) if axis.size > 1]
+    return float(np.mean(steps)) if steps else 1.0
 
 
 def select_representative_track(
-    candidates: Sequence[Mapping[str, Any]], min_lifetime_hours: float | None
+    candidates: Sequence[Mapping[str, Any]],
+    min_lifetime_hours: float | None,
+    *,
+    coastal_buffer_m: float | None = None,
+    null_p99_hours: float | None = None,
 ) -> tuple[Mapping[str, Any] | None, str]:
     """從站內出生的未截尾真實 track 選出代表 track。
 
-    ``candidates`` 每筆含 ``track_id``、``lifetime_hours``、``mean_core_s1_sinv``。若有壽命
-    不小於 ``min_lifetime_hours`` 的候選，只在其中選；否則在全部候選中選。選擇規則：壽命最長，
-    同壽命取平均核心 s1 最強（最負），再同則取較小 ``track_id``（決定性）。回傳
-    ``(選中記錄或 None, 準則)``，準則為 ``ge_threshold``／``longest_available``／``no_candidate``。
+    ``candidates`` 每筆含 ``track_id``、``lifetime_hours``、``mean_core_s1_sinv``；有近岸資訊時另含
+    ``mean_coast_m``（track 全部觀測的平均核心距岸距離）。排序規則一律為：壽命最長，同壽命取平均核心 s1 最強
+    （最負），再同則取較小 ``track_id``（決定性）。
+
+    * 未給 ``coastal_buffer_m``（舊行為）：若有壽命不小於 ``min_lifetime_hours`` 的候選，只在其中選，準則為
+      ``ge_threshold``／``longest_available``／``no_candidate``。
+    * 給 ``coastal_buffer_m``：優先取「平均距岸不小於緩衝帶」且（給定 ``null_p99_hours`` 時）壽命嚴格大於隨機對照
+      p99 的最長者（準則 ``offshore_exceeds_null``；無對照時 ``offshore_longest``）。沒有這樣的候選就退回整體最長者，
+      準則明示為 ``fallback_coastal``（該 track 屬近岸型）或 ``fallback_offshore_below_null``（近岸外但壽命未超過對照）。
     """
 
     if not candidates:
         return None, "no_candidate"
     pool = list(candidates)
+
+    def _best(items: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
+        return min(items, key=lambda item: (-float(item["lifetime_hours"]), float(item["mean_core_s1_sinv"]), int(item["track_id"])))
+
+    if coastal_buffer_m is not None:
+        offshore = [
+            item for item in pool if item.get("mean_coast_m") is not None and not float(item["mean_coast_m"]) < float(coastal_buffer_m)
+        ]
+        strict = offshore
+        if null_p99_hours is not None:
+            strict = [item for item in offshore if float(item["lifetime_hours"]) > float(null_p99_hours)]
+        if strict:
+            return _best(strict), ("offshore_exceeds_null" if null_p99_hours is not None else "offshore_longest")
+        chosen = _best(pool)
+        is_coastal = chosen.get("mean_coast_m") is not None and float(chosen["mean_coast_m"]) < float(coastal_buffer_m)
+        return chosen, ("fallback_coastal" if is_coastal else "fallback_offshore_below_null")
+
     criterion = "longest_available"
     if min_lifetime_hours is not None:
         restricted = [item for item in pool if float(item["lifetime_hours"]) >= float(min_lifetime_hours)]
         if restricted:
             pool, criterion = restricted, "ge_threshold"
-    chosen = min(
-        pool, key=lambda item: (-float(item["lifetime_hours"]), float(item["mean_core_s1_sinv"]), int(item["track_id"]))
+    return _best(pool), criterion
+
+
+def select_coastal_track(
+    candidates: Sequence[Mapping[str, Any]], coastal_buffer_m: float
+) -> Mapping[str, Any] | None:
+    """近岸型代表 track：平均核心距岸小於緩衝帶者中壽命最長（同壽命取核心最強，再取較小 track_id）；沒有則 ``None``。"""
+
+    coastal = [
+        item for item in candidates if item.get("mean_coast_m") is not None and float(item["mean_coast_m"]) < float(coastal_buffer_m)
+    ]
+    if not coastal:
+        return None
+    return min(coastal, key=lambda item: (-float(item["lifetime_hours"]), float(item["mean_core_s1_sinv"]), int(item["track_id"])))
+
+
+def _observation_coast(observations: Mapping[str, np.ndarray]) -> np.ndarray | None:
+    """觀測的核心距岸距離（m）；沒有該欄位（舊 track 輸出且尚未補算）時為 ``None``。"""
+
+    values = observations.get("core_coast_distance_m")
+    return None if values is None else np.asarray(values, dtype=np.float64)
+
+
+def _mean_coast_m(values: np.ndarray) -> float | None:
+    """一條 track 的平均核心距岸距離；全部缺值時為 ``None``。"""
+
+    finite = values[np.isfinite(values)]
+    return float(np.mean(finite)) if finite.size else None
+
+
+def ensure_observation_coast(context: dict[str, Any], grid: Mapping[str, Any]) -> None:
+    """舊 track 輸出（沒有 ``core_coast_distance_m``）時，以 domain 的距離場在觀測核心位置補算。"""
+
+    observations = context["observations"]
+    if "core_coast_distance_m" in observations:
+        return
+    observations["core_coast_distance_m"] = sample_coast_distance(
+        grid["coast_distance_m"], grid["x_m_axis"], grid["y_m_axis"], observations["core_x_m"], observations["core_y_m"]
     )
-    return chosen, criterion
 
 
 def _process_track_lifetimes(
@@ -653,6 +809,8 @@ def _process_track_lifetimes(
     spatial_accumulators: dict[str, dict[str, dict[str, np.ndarray]]],
     evolution_min_hours: float = LIFETIME_EVOLUTION_MIN_HOURS,
     long_track_hours: float | None = None,
+    prop_min_obs: int = PROP_MIN_OBS,
+    coast_buffer_m: float | None = None,
 ) -> None:
     """以 track_observations／tracks.csv 計算各站壽命統計、演化曲線、傳播速度，並累加站內逐格分布。
 
@@ -663,7 +821,12 @@ def _process_track_lifetimes(
     另累加：(1) 逐格「通過該格的不同 track 數」``track_count``（全部真實 track，含截尾；每 track 每格計一次，
     Kunz et al. 2024 Fig. 4c）與 ``long_track_count``（未截尾且壽命 ≥ ``long_track_hours``；``None`` 則不計）；
     (2) 首個觀測在該站分析區內的未截尾 track 記錄 ``born_uncensored``（代表 track 與長壽命路徑圖用）；
-    (3) 至少 3 個觀測的 track，其落在該站分析區內的內部觀測之中心差分傳播速度（僅 ``all`` 分層）。
+    (3) 至少 ``max(3, prop_min_obs)`` 個觀測的 track，以全部觀測的線性擬合估計傳播速度（``fit_track_velocity``），
+    擬合位移小於 1 格（``grid_cell_size_m``）者標為靜止（僅 ``all`` 分層）。
+
+    給定 ``coast_buffer_m`` 且 track 觀測含 ``core_coast_distance_m`` 時，另以 track 全部觀測的平均距岸距離判定
+    近岸型（小於緩衝帶）或近岸外，累加各分層的近岸型／近岸外未截尾壽命、長壽命 track 的近岸型數量，以及長壽命
+    track 觀測的距岸直方圖；``born_uncensored`` 記錄附 ``mean_coast_m``。
     """
 
     shape = grid["shape"]
@@ -673,6 +836,9 @@ def _process_track_lifetimes(
     if observations["track_id"].size == 0:
         return
 
+    obs_coast = _observation_coast(observations) if coast_buffer_m is not None else None
+    min_obs = max(PROP_MIN_OBS, int(prop_min_obs))
+    stationary_cell_m = grid_cell_size_m(grid)
     cols = _nearest_indices(grid["x_m_axis"], observations["core_x_m"])
     rows = _nearest_indices(grid["y_m_axis"], observations["core_y_m"])
     flat = rows.astype(np.int64) * np.int64(nx) + cols.astype(np.int64)
@@ -692,7 +858,13 @@ def _process_track_lifetimes(
         is_long = bool(is_uncensored and long_track_hours is not None and lifetime_hours >= float(long_track_hours))
         profile: np.ndarray | None = None
         profile_ready = False
-        propagation: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+        fit: PropagationFit | None = None
+        fit_ready = False
+        mean_coast: float | None = None
+        is_coastal = False
+        if obs_coast is not None:
+            mean_coast = _mean_coast_m(obs_coast[segment])
+            is_coastal = bool(mean_coast is not None and mean_coast < float(coast_buffer_m))
 
         for site_id, mask_flat in flat_masks.items():
             in_mask = mask_flat[segment_flat]
@@ -708,6 +880,9 @@ def _process_track_lifetimes(
                 accumulator["track_lifetimes_all"].append(lifetime_hours)
                 if is_uncensored:
                     accumulator["track_lifetimes"].append(lifetime_hours)
+                    if obs_coast is not None:
+                        accumulator["coast_info"] = True
+                        accumulator["track_lifetimes_coastal" if is_coastal else "track_lifetimes_offshore"].append(lifetime_hours)
             for stratum in (season, year):
                 spatial = spatial_accumulators[site_id].setdefault(stratum, _new_spatial_accumulator(shape))
                 spatial["track_count"].reshape(-1)[visited_cells] += 1
@@ -715,17 +890,14 @@ def _process_track_lifetimes(
                     spatial["long_track_count"].reshape(-1)[visited_cells] += 1
 
             all_accumulator = site_accumulators[(site_id, "all")]
-            if segment.size >= 3:
-                if propagation is None:
-                    propagation = propagation_velocity_kmday(
-                        segment_times, observations["core_x_m"][segment], observations["core_y_m"][segment]
+            if segment.size >= min_obs:
+                if not fit_ready:
+                    fit = fit_track_velocity(segment_times, observations["core_x_m"][segment], observations["core_y_m"][segment])
+                    fit_ready = True
+                if fit is not None:
+                    all_accumulator["prop_tracks"].append(
+                        (fit.cx_kmday, fit.cy_kmday, fit.resid_rms_m, fit.displacement_m, bool(fit.displacement_m < stationary_cell_m))
                     )
-                interior, cx, cy = propagation
-                keep = in_mask[interior]
-                if np.any(keep):
-                    all_accumulator["prop_cx_kmday"].append(cx[keep])
-                    all_accumulator["prop_cy_kmday"].append(cy[keep])
-                    all_accumulator["prop_track_n"] += 1
 
             if not is_uncensored:
                 continue
@@ -738,8 +910,21 @@ def _process_track_lifetimes(
                         "n_obs": int(segment.size),
                         "start": int(segment[0]),
                         "stop": int(segment[-1]) + 1,
+                        "mean_coast_m": mean_coast,
+                        "coastal": is_coastal,
                     }
                 )
+                if is_long and obs_coast is not None:
+                    long_coast_km = np.clip(
+                        obs_coast[segment][np.isfinite(obs_coast[segment])] / 1000.0, 0.0, COAST_HIST_EDGES_KM[-1] - 1.0e-9
+                    )
+                    long_hist = np.histogram(long_coast_km, bins=COAST_HIST_EDGES_KM)[0]
+                    for stratum in ("all", season, year):
+                        accumulator = site_accumulators[(site_id, stratum)]
+                        accumulator["coast_info"] = True
+                        accumulator["long_track_n"] += 1
+                        accumulator["long_track_coastal_n"] += int(is_coastal)
+                        accumulator["coast_hist_long"] += long_hist
             for stratum in (season, year):
                 spatial = spatial_accumulators[site_id][stratum]
                 spatial["lifetime_count"].reshape(-1)[visited_cells] += 1
@@ -759,22 +944,32 @@ def _process_track_lifetimes(
 # ---------------------------------------------------------------------------
 
 
-def _track_lifetimes_by_site(
-    context: Mapping[str, Any], site_masks_2d: Mapping[str, np.ndarray], grid: Mapping[str, Any]
-) -> dict[str, list[float]]:
-    """依與真實 track 完全相同的規則，回傳各站（stratum ``all``）未截尾 track 壽命（小時）。
+def _null_track_records_by_site(
+    context: Mapping[str, Any],
+    site_masks_2d: Mapping[str, np.ndarray],
+    grid: Mapping[str, Any],
+    coast_buffer_m: float | None = None,
+) -> dict[str, dict[str, list[Any]]]:
+    """依與真實 track 完全相同的規則，回傳各站（stratum ``all``）null 未截尾 track 的壽命與近岸型旗標。
 
-    track 依「首個落在該站分析區內的觀測」指派給該站（只要有任一觀測在站內即屬於該站）；
-    僅計未截尾 track。這是 :func:`_process_track_lifetimes` 中 ``all`` 分層 ``track_lifetimes``
-    的獨立重現，供 null 對照組使用（null 沒有對應的 detect-root 逐格統計）。
+    每站回傳四個平行清單：
+
+    * ``lifetimes`` 與 ``coastal``：「首個落在站內」規則之外，只要有任一觀測在站內即屬於該站的未截尾 track
+      （:func:`_process_track_lifetimes` 中 ``all`` 分層 ``track_lifetimes`` 的獨立重現）；
+    * ``born_lifetimes`` 與 ``born_coastal``：首個觀測落在站點分析區內的未截尾 track（長壽命 track 的 null 對照用）。
+
+    ``coastal`` 為 track 平均核心距岸小於 ``coast_buffer_m``（沒有近岸資訊時一律 ``False``）。
     """
 
     nx = grid["shape"][1]
     observations = context["observations"]
     tracks_by_id = context["tracks_by_id"]
-    result: dict[str, list[float]] = {site_id: [] for site_id in site_masks_2d}
+    result: dict[str, dict[str, list[Any]]] = {
+        site_id: {"lifetimes": [], "coastal": [], "born_lifetimes": [], "born_coastal": []} for site_id in site_masks_2d
+    }
     if observations["track_id"].size == 0:
         return result
+    obs_coast = _observation_coast(observations) if coast_buffer_m is not None else None
     cols = _nearest_indices(grid["x_m_axis"], observations["core_x_m"])
     rows = _nearest_indices(grid["y_m_axis"], observations["core_y_m"])
     flat = rows.astype(np.int64) * np.int64(nx) + cols.astype(np.int64)
@@ -784,38 +979,18 @@ def _track_lifetimes_by_site(
         if track is None or track["left_censored"] or track["right_censored"]:
             continue
         segment_flat = flat[segment]
+        is_coastal = False
+        if obs_coast is not None:
+            mean_coast = _mean_coast_m(obs_coast[segment])
+            is_coastal = bool(mean_coast is not None and mean_coast < float(coast_buffer_m))
+        first_flat = int(segment_flat[0])
         for site_id, mask_flat in flat_masks.items():
             if np.any(mask_flat[segment_flat]):
-                result[site_id].append(float(track["lifetime_hours"]))
-    return result
-
-
-def _born_uncensored_lifetimes_by_site(
-    context: Mapping[str, Any], site_masks_2d: Mapping[str, np.ndarray], grid: Mapping[str, Any]
-) -> dict[str, list[float]]:
-    """各站「首個觀測落在站點分析區內」的未截尾 track 壽命（小時）；長壽命 track 的 null 對照用。
-
-    規則與 :func:`_process_track_lifetimes` 的 ``born_uncensored`` 完全相同（真實與 null 共用同一準則）。
-    """
-
-    nx = grid["shape"][1]
-    observations = context["observations"]
-    tracks_by_id = context["tracks_by_id"]
-    result: dict[str, list[float]] = {site_id: [] for site_id in site_masks_2d}
-    if observations["track_id"].size == 0:
-        return result
-    cols = _nearest_indices(grid["x_m_axis"], observations["core_x_m"])
-    rows = _nearest_indices(grid["y_m_axis"], observations["core_y_m"])
-    flat = rows.astype(np.int64) * np.int64(nx) + cols.astype(np.int64)
-    flat_masks = {site_id: mask.reshape(-1) for site_id, mask in site_masks_2d.items()}
-    for segment in _track_segments(observations):
-        track = tracks_by_id.get(int(observations["track_id"][segment[0]]))
-        if track is None or track["left_censored"] or track["right_censored"]:
-            continue
-        first_flat = int(flat[segment[0]])
-        for site_id, mask_flat in flat_masks.items():
+                result[site_id]["lifetimes"].append(float(track["lifetime_hours"]))
+                result[site_id]["coastal"].append(is_coastal)
             if bool(mask_flat[first_flat]):
-                result[site_id].append(float(track["lifetime_hours"]))
+                result[site_id]["born_lifetimes"].append(float(track["lifetime_hours"]))
+                result[site_id]["born_coastal"].append(is_coastal)
     return result
 
 
@@ -869,7 +1044,50 @@ def null_column_names(lifetime_thresholds_hours: Sequence[float]) -> list[str]:
         *[f"null_{name}" for name in fractions],
         *[f"excess_{name}" for name in fractions],
         *[f"ratio_{name}" for name in fractions],
+        *_null_group_column_names(lifetime_thresholds_hours),
     ]
+
+
+COAST_GROUPS = ("offshore", "coastal")
+"""track 依平均核心距岸距離分成近岸外（不小於緩衝帶）與近岸型（小於緩衝帶）。"""
+
+
+def group_fraction_column(group: str, hours: float) -> str:
+    """近岸外／近岸型未截尾壽命比例欄位名 ``<group>_track_frac_uncensored_ge_<N>h``。"""
+
+    return f"{group}_track_frac_uncensored_ge_{threshold_label(hours)}h"
+
+
+def _null_group_column_names(thresholds_hours: Sequence[float]) -> list[str]:
+    names: list[str] = []
+    for group in COAST_GROUPS:
+        names.append(f"null_{group}_track_n_uncensored")
+        names.extend(f"null_{group_fraction_column(group, h)}" for h in thresholds_hours)
+        names.extend(f"excess_{group_fraction_column(group, h)}" for h in thresholds_hours)
+    return names
+
+
+def _null_group_columns(
+    real_record: Mapping[str, Any],
+    null_sets_by_group: Mapping[str, Sequence[Sequence[float]]],
+    thresholds_hours: Sequence[float],
+) -> dict[str, Any]:
+    """stratum ``all`` 的近岸外／近岸型 null 欄位：各 seed 平均的 n 與 frac，以及超額（真實減 null）。"""
+
+    columns: dict[str, Any] = {}
+    for group in COAST_GROUPS:
+        summaries = [_lifetime_summary(values, thresholds_hours) for values in null_sets_by_group.get(group, [])]
+        columns[f"null_{group}_track_n_uncensored"] = _mean_or_none([float(item["n"]) for item in summaries])
+        for hours in thresholds_hours:
+            name = lifetime_fraction_column(hours)
+            real_name = group_fraction_column(group, hours)
+            null_frac = _mean_or_none([item["frac"][name] for item in summaries])
+            real_frac = real_record.get(real_name)
+            columns[f"null_{real_name}"] = null_frac
+            columns[f"excess_{real_name}"] = (
+                (real_frac - null_frac) if (real_frac is not None and null_frac is not None) else None
+            )
+    return columns
 
 
 def _mean_or_none(values: Sequence[float | None]) -> float | None:
@@ -1014,6 +1232,7 @@ def _site_hotspots(
     cell_area_m2: np.ndarray,
     hotspot_quantile: float,
     min_cells: int = HOTSPOT_MIN_CELLS,
+    coast_buffer_mask: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """計算一個站×分層的熱點遮罩與指標。
 
@@ -1024,6 +1243,11 @@ def _site_hotspots(
 
     統計與 ``curve_mask``／``core_mask`` 保持未濾除定義；另回傳 ``curve_mask_filtered``／
     ``core_mask_filtered``（移除 4-連通格數 < ``min_cells`` 的小塊），只供圖面與 npz 附加陣列。
+
+    給定 ``coast_buffer_mask``（近岸緩衝帶內的格點）時另算：``hotspot_frac_area_within_buffer``（熱點面積落在緩衝帶內
+    的比例），以及只在近岸外格點（站內且不在緩衝帶）重新取分位數的近岸外熱點——格數
+    ``offshore_hotspot_cell_count`` 與平均曲線通過頻率 ``offshore_hotspot_mean_curve_pass_frequency``，
+    用來檢視「去除海岸帶後熱點仍有多強」。未給遮罩時這些欄位為 ``None``。
     """
 
     curve_mask, curve_threshold = _top_quantile_mask(finalized["curve_pass_frequency"], site_mask, hotspot_quantile)
@@ -1039,6 +1263,21 @@ def _site_hotspots(
     )
     strong_total = int(accumulator["strong_core_count"][site_mask].sum())
     strong_in_hotspot = int(accumulator["strong_core_count"][curve_mask].sum()) if cell_count else 0
+    frac_area_within_buffer: float | None = None
+    offshore_cell_count: int | None = None
+    offshore_mean_curve: float | None = None
+    if coast_buffer_mask is not None:
+        buffer_mask = np.asarray(coast_buffer_mask, dtype=bool)
+        area_array = np.asarray(cell_area_m2, dtype=np.float64)
+        if cell_count and area_km2 > 0.0:
+            frac_area_within_buffer = float(np.sum(area_array[curve_mask & buffer_mask])) / 1.0e6 / area_km2
+        offshore_mask, _offshore_threshold = _top_quantile_mask(
+            finalized["curve_pass_frequency"], np.asarray(site_mask, dtype=bool) & ~buffer_mask, hotspot_quantile
+        )
+        offshore_cell_count = int(offshore_mask.sum())
+        offshore_mean_curve = (
+            float(np.mean(np.asarray(finalized["curve_pass_frequency"])[offshore_mask])) if offshore_cell_count else None
+        )
     return {
         "curve_mask": curve_mask,
         "core_mask": core_mask,
@@ -1053,33 +1292,49 @@ def _site_hotspots(
             "hotspot_mean_curve_pass_frequency": mean_curve,
             "hotspot_mean_core_s1_day": mean_core_s1_day,
             "hotspot_strong_core_fraction": (strong_in_hotspot / strong_total) if strong_total else None,
+            "hotspot_frac_area_within_buffer": frac_area_within_buffer,
+            "offshore_hotspot_cell_count": offshore_cell_count,
+            "offshore_hotspot_mean_curve_pass_frequency": offshore_mean_curve,
         },
     }
 
 
 PROPAGATION_COLUMNS = (
-    "prop_n",
+    "prop_n_tracks",
+    "prop_n_moving",
+    "prop_n_stationary",
+    "prop_stationary_frac",
     "prop_cx_median_kmday",
     "prop_cy_median_kmday",
     "prop_speed_median_kmday",
     "prop_speed_p90_kmday",
+    "prop_resid_rms_median_m",
 )
 
 
 def _propagation_columns(accumulator: Mapping[str, Any] | None) -> dict[str, Any]:
     """stratum ``all`` 的核心傳播速度統計（km/day）；其他分層或無樣本時各欄為 ``None``。
 
-    ``prop_n`` 是中心差分速度樣本數（至少 3 個觀測的 track 之站內內部觀測）；其他分層固定 ``None``，
-    ``all`` 但零樣本時 ``prop_n = 0`` 而統計為 ``None``。速率為 ``hypot(cx, cy)``。
+    每條 track（至少 ``max(3, --prop-min-obs)`` 個觀測）一筆線性擬合速度；``prop_n_tracks`` 為已擬合條數，
+    ``prop_stationary_frac`` 為擬合位移小於 1 格的靜止 track 比例。速度統計（cx／cy 中位數、速率中位數與 p90）
+    只含移動 track（速率為零沒有方向，且會被格點量化左右）；``prop_resid_rms_median_m`` 是全部已擬合 track 位置
+    殘差 RMS 的中位數。其他分層固定 ``None``；``all`` 但零條 track 時 ``prop_n_tracks = 0``、其餘為 ``None``。
     """
 
     columns: dict[str, Any] = dict.fromkeys(PROPAGATION_COLUMNS)
     if accumulator is None:
         return columns
-    cx = np.concatenate(accumulator["prop_cx_kmday"]) if accumulator["prop_cx_kmday"] else np.zeros(0)
-    cy = np.concatenate(accumulator["prop_cy_kmday"]) if accumulator["prop_cy_kmday"] else np.zeros(0)
-    columns["prop_n"] = int(cx.size)
-    if cx.size:
+    fitted = np.asarray(accumulator["prop_tracks"], dtype=np.float64).reshape(-1, 5)
+    columns["prop_n_tracks"] = int(fitted.shape[0])
+    if fitted.shape[0] == 0:
+        return columns
+    moving = fitted[:, 4] == 0.0
+    columns["prop_n_moving"] = int(moving.sum())
+    columns["prop_n_stationary"] = int((~moving).sum())
+    columns["prop_stationary_frac"] = float((~moving).sum() / fitted.shape[0])
+    columns["prop_resid_rms_median_m"] = float(np.median(fitted[:, 2]))
+    if moving.any():
+        cx, cy = fitted[moving, 0], fitted[moving, 1]
         speed = np.hypot(cx, cy)
         columns["prop_cx_median_kmday"] = float(np.median(cx))
         columns["prop_cy_median_kmday"] = float(np.median(cy))
@@ -1100,8 +1355,13 @@ def _finalize_site_record(
     bootstrap_reps: int,
     rng: np.random.Generator,
     lifetime_thresholds_hours: Sequence[float] = LIFETIME_THRESHOLD_HOURS,
+    coast_buffer_km: float | None = None,
 ) -> dict[str, Any]:
-    """把一組 site×stratum 累加器轉成 site_statistics 記錄（``scope`` 固定為 site_area）。"""
+    """把一組 site×stratum 累加器轉成 site_statistics 記錄（``scope`` 固定為 site_area）。
+
+    ``coast_buffer_km`` 給定且累加器帶有近岸資訊時，輸出近岸診斷欄位：站內核心／強核心／長壽命 track 落在
+    近岸緩衝帶內的比例，去除近岸帶後的強核心出現率，以及近岸外／近岸型的未截尾壽命比例。
+    """
 
     n_valid = int(accumulator["n_valid"])
 
@@ -1159,12 +1419,35 @@ def _finalize_site_record(
         "track_p90_lifetime_hours": _quantile_or_none(lifetimes, 0.9),
         **frac_ge,
     }
+    if coast_buffer_km is not None and accumulator.get("coast_info"):
+        core_total = int(accumulator.get("core_count_total", 0))
+        strong_total = int(accumulator.get("strong_core_count_total", 0))
+        long_total = int(accumulator.get("long_track_n", 0))
+        record.update(
+            {
+                "coastal_buffer_km": float(coast_buffer_km),
+                "frac_cores_within_buffer": (accumulator["core_near_count"] / core_total) if core_total else None,
+                "frac_strong_cores_within_buffer": (accumulator["strong_core_near_count"] / strong_total) if strong_total else None,
+                "long_track_n_born_uncensored": long_total,
+                "frac_long_tracks_within_buffer": (accumulator["long_track_coastal_n"] / long_total) if long_total else None,
+                "offshore_strong_core_occurrence_rate": (
+                    float(accumulator["offshore_strong_occurrence"] / n_valid) if n_valid else None
+                ),
+            }
+        )
+        for group in COAST_GROUPS:
+            group_lifetimes = accumulator.get(f"track_lifetimes_{group}", [])
+            record[f"{group}_track_n_uncensored"] = len(group_lifetimes)
+            for threshold in lifetime_thresholds_hours:
+                record[group_fraction_column(group, threshold)] = (
+                    float(sum(1 for value in group_lifetimes if value >= threshold) / len(group_lifetimes)) if group_lifetimes else None
+                )
     record.update(_propagation_columns(accumulator if stratum == "all" else None))
     record.update(hotspot_metrics)
     return record
 
 
-SITE_STAT_FIELDNAMES = (
+_STAT_BASE_HEAD = (
     "site_id", "site_name_zh", "scope", "stratum", "n_valid_snapshots",
     "core_occurrence_numerator", "core_occurrence_rate", "core_occurrence_rate_ci95",
     "strong_core_occurrence_numerator", "strong_core_occurrence_rate", "strong_core_occurrence_rate_ci95",
@@ -1175,11 +1458,31 @@ SITE_STAT_FIELDNAMES = (
     "core_s1_count", "core_s1_mean_sinv", "core_s1_median_sinv", "core_s1_p10_sinv",
     "core_s1_mean_day", "core_s1_median_day", "core_s1_p10_day",
     "track_n_tracks", "track_n_uncensored", "track_mean_lifetime_hours", "track_median_lifetime_hours",
-    "track_p90_lifetime_hours", "track_frac_uncensored_ge_6h", "track_frac_uncensored_ge_12h", "track_frac_uncensored_ge_24h",
+    "track_p90_lifetime_hours",
+)
+_STAT_BASE_TAIL = (
     "hotspot_quantile", "hotspot_threshold_curve_pass_frequency", "hotspot_cell_count", "hotspot_area_km2",
     "hotspot_mean_curve_pass_frequency", "hotspot_mean_core_s1_day", "hotspot_strong_core_fraction",
-    "prop_n", "prop_cx_median_kmday", "prop_cy_median_kmday", "prop_speed_median_kmday", "prop_speed_p90_kmday",
+    "hotspot_frac_area_within_buffer", "offshore_hotspot_cell_count", "offshore_hotspot_mean_curve_pass_frequency",
+    *PROPAGATION_COLUMNS,
+    "coastal_buffer_km", "frac_cores_within_buffer", "frac_strong_cores_within_buffer",
+    "long_track_n_born_uncensored", "frac_long_tracks_within_buffer", "offshore_strong_core_occurrence_rate",
 )
+
+
+def _stat_fieldnames(thresholds_hours: Sequence[float]) -> list[str]:
+    """site_statistics 的基本欄位；壽命門檻決定 ``track_frac_*`` 及近岸外／近岸型壽命比例欄位。"""
+
+    names = list(_STAT_BASE_HEAD)
+    names.extend(lifetime_fraction_column(hours) for hours in thresholds_hours)
+    names.extend(_STAT_BASE_TAIL)
+    for group in COAST_GROUPS:
+        names.append(f"{group}_track_n_uncensored")
+        names.extend(group_fraction_column(group, hours) for hours in thresholds_hours)
+    return names
+
+
+SITE_STAT_FIELDNAMES = tuple(_stat_fieldnames(LIFETIME_THRESHOLD_HOURS))
 
 
 def site_stat_fieldnames(
@@ -1191,14 +1494,11 @@ def site_stat_fieldnames(
     """依壽命門檻設定產生 CSV 欄位；預設門檻等同 :data:`SITE_STAT_FIELDNAMES`。
 
     ``with_track_filter`` 附加 ``track_core_filter_quantile``（track 只含各站前 q 強核心時）；
-    ``with_null`` 附加 :func:`null_column_names` 的 null／excess／ratio 欄位。兩者未啟用時欄位與
-    舊版完全相同。
+    ``with_null`` 附加 :func:`null_column_names` 的 null／excess／ratio 欄位（含近岸外／近岸型的 null 與超額）。
+    兩者未啟用時欄位只含基本欄位與近岸診斷欄位。
     """
 
-    default_columns = [lifetime_fraction_column(hours) for hours in LIFETIME_THRESHOLD_HOURS]
-    anchor = SITE_STAT_FIELDNAMES.index(default_columns[0])
-    columns = [lifetime_fraction_column(hours) for hours in lifetime_thresholds_hours]
-    names = [*SITE_STAT_FIELDNAMES[:anchor], *columns, *SITE_STAT_FIELDNAMES[anchor + len(default_columns) :]]
+    names = _stat_fieldnames(lifetime_thresholds_hours)
     if with_track_filter:
         names.append("track_core_filter_quantile")
     if with_null:
@@ -1301,11 +1601,12 @@ def _period_label(domain_context: Mapping[str, dict[str, Any]]) -> str:
 
 
 def _figure_relative_paths(site_id: str) -> list[str]:
-    """一個站的成果圖相對路徑（``figures/<site_id>/site_<site_id>_<kind>.png``）：五張基本圖＋WP-H 的五張。"""
+    """一個站的成果圖相對路徑（``figures/<site_id>/site_<site_id>_<kind>.png``）：五張基本圖、WP-H 的五張，以及 WP-I 的
+    ``example_coastal``（該站沒有近岸型長壽命 track 時不輸出）與 ``coastal_diagnostic``。"""
 
     return [
         f"figures/{site_id}/site_{site_id}_{kind}.png"
-        for kind in (*FIGURE_KINDS, *EXAMPLE_FIGURE_KINDS, *TRACK_FIGURE_KINDS)
+        for kind in (*FIGURE_KINDS, *EXAMPLE_FIGURE_KINDS, *TRACK_FIGURE_KINDS, *COASTAL_FIGURE_KINDS)
     ]
 
 
@@ -1317,6 +1618,13 @@ def _resolve_figure_font() -> Any:
     return resolve_cjk_font()
 
 
+def _null_p99_hours(null_runs: Sequence[Mapping[str, Any]], site_id: str) -> float | None:
+    """該站各 seed 對照組未截尾壽命合併後的第 99 百分位（小時）；沒有對照或沒有 null track 時為 ``None``。"""
+
+    pooled = [value for run in null_runs for value in run["lifetimes"].get(site_id, [])]
+    return float(np.quantile(np.asarray(pooled, dtype=np.float64), 0.99)) if pooled else None
+
+
 def _render_site_wp_h_figures(
     *,
     output_dir: Path,
@@ -1326,9 +1634,7 @@ def _render_site_wp_h_figures(
     domain_id: str,
     grid: Mapping[str, Any],
     born_records: Sequence[Mapping[str, Any]],
-    prop_cx: Sequence[np.ndarray],
-    prop_cy: Sequence[np.ndarray],
-    prop_track_n: int,
+    prop_tracks: Sequence[Sequence[float]],
     null_runs: Sequence[Mapping[str, Any]],
     long_track_hours: float,
     lifetime_thresholds: Sequence[float],
@@ -1341,12 +1647,14 @@ def _render_site_wp_h_figures(
     state_label: str,
     param_id: str,
     period_label: str,
+    coast_buffer_m: float | None = None,
 ) -> dict[str, Any]:
-    """一個站的 WP-H 圖：長壽命 track 路徑、track 通過數、傳播速度，以及（可選）代表 TRAP 與方法比較。
+    """一個站的 WP-H／WP-I 圖：長壽命 track 路徑、track 通過數、傳播速度，以及（可選）代表 TRAP、近岸型代表與方法比較。
 
-    代表 track 只取「首個觀測在站內、未截尾」的真實 track：優先在壽命不小於最大壽命門檻者中選壽命最長者
-    （同壽命取平均核心 s1 最強），沒有達門檻者則取最長者；沒有任何候選時仍輸出空白說明圖，不製造資料。
-    回傳 ``{"paths": 相對路徑清單, "manifest": 該站紀錄}``。
+    代表 track 只取「首個觀測在站內、未截尾」的真實 track。給定 ``coast_buffer_m`` 時（預設流程）優先取平均核心
+    距岸不小於緩衝帶、且壽命超過該站隨機對照 p99 的最長者（沒有對照時略過 p99 條件）；沒有這樣的 track 就退回整體
+    最長者並在圖面明示（「（近岸型）」等）。另輸出 ``site_<id>_example_coastal.png``：最長的近岸型 track（沒有就不輸出）。
+    沒有任何候選時仍輸出空白說明圖，不製造資料。回傳 ``{"paths": 相對路徑清單, "manifest": 該站紀錄}``。
     """
 
     from . import example_figures
@@ -1369,18 +1677,36 @@ def _render_site_wp_h_figures(
         float(sum(1 for value in run["born_lifetimes"].get(site_id, []) if value >= long_track_hours)) for run in null_runs
     ]
     null_long_mean = float(np.mean(null_counts)) if null_counts else None
+    has_coast = coast_buffer_m is not None
+    n_long_coastal = sum(1 for item in long_records if item.get("coastal")) if has_coast else None
+    n_long_offshore = (len(long_records) - n_long_coastal) if has_coast else None
+    null_coastal_counts: list[float] = []
+    null_offshore_counts: list[float] = []
+    for run in null_runs:
+        record = run["records"].get(site_id, {"born_lifetimes": [], "born_coastal": []})
+        flags = [(value >= long_track_hours, coastal) for value, coastal in zip(record["born_lifetimes"], record["born_coastal"], strict=True)]
+        null_coastal_counts.append(float(sum(1 for long, coastal in flags if long and coastal)))
+        null_offshore_counts.append(float(sum(1 for long, coastal in flags if long and not coastal)))
+    fitted = np.asarray(prop_tracks, dtype=np.float64).reshape(-1, 5)
     track_inputs = example_figures.TrackFigureInputs(
         x_m_axis=grid["x_m_axis"],
         y_m_axis=grid["y_m_axis"],
         long_track_hours=long_track_hours,
         long_tracks=long_tracks,
         n_long_total=len(long_records),
-        prop_cx_kmday=np.concatenate(prop_cx) if prop_cx else np.zeros(0),
-        prop_cy_kmday=np.concatenate(prop_cy) if prop_cy else np.zeros(0),
-        prop_track_n=prop_track_n,
+        prop_cx_kmday=fitted[:, 0],
+        prop_cy_kmday=fitted[:, 1],
+        prop_track_n=int(fitted.shape[0]),
         nominal_step_hours=nominal_step_hours,
         null_long_mean=null_long_mean,
         null_n_seeds=len(null_counts),
+        long_coastal=[bool(item.get("coastal")) for item in drawn] if has_coast else (),
+        n_long_coastal_total=n_long_coastal,
+        n_long_offshore_total=n_long_offshore,
+        null_long_coastal_mean=float(np.mean(null_coastal_counts)) if (has_coast and null_coastal_counts) else None,
+        null_long_offshore_mean=float(np.mean(null_offshore_counts)) if (has_coast and null_offshore_counts) else None,
+        prop_stationary=fitted[:, 4] != 0.0,
+        prop_resid_rms_m=fitted[:, 2],
     )
     paths = list(
         example_figures.render_track_figures(
@@ -1394,33 +1720,46 @@ def _render_site_wp_h_figures(
             period_label=period_label,
         )
     )
+    n_stationary = int(np.count_nonzero(track_inputs.prop_stationary))
     record: dict[str, Any] = {
         "long_track_hours": long_track_hours,
         "n_long_tracks": len(long_records),
         "n_long_tracks_drawn": len(drawn),
+        "n_long_tracks_coastal": n_long_coastal,
+        "n_long_tracks_offshore": n_long_offshore,
         "null_long_track_mean": null_long_mean,
+        "null_long_track_coastal_mean": track_inputs.null_long_coastal_mean,
+        "null_long_track_offshore_mean": track_inputs.null_long_offshore_mean,
         "null_n_seeds": len(null_counts),
-        "propagation_n": int(track_inputs.prop_cx_kmday.size),
-        "propagation_n_tracks": prop_track_n,
+        "propagation_n_tracks": int(fitted.shape[0]),
+        "propagation_n_moving": int(fitted.shape[0]) - n_stationary,
+        "propagation_n_stationary": n_stationary,
         "example": {"enabled": bool(example_enabled)},
     }
     if example_enabled:
-        chosen, criterion = select_representative_track(born_records, max(lifetime_thresholds))
-        snapshot = None
-        if chosen is not None:
-            snapshot = example_figures.prepare_example_snapshot(
+        null_p99 = _null_p99_hours(null_runs, site_id) if has_coast else None
+        chosen, criterion = select_representative_track(
+            born_records, max(lifetime_thresholds), coastal_buffer_m=coast_buffer_m, null_p99_hours=null_p99
+        )
+
+        def _prepare(item: Mapping[str, Any], item_criterion: str, variant: str) -> Any:
+            return example_figures.prepare_example_snapshot(
                 detect_root=detect_root,
                 domain_id=domain_id,
                 shard_manifests=context["shard_manifests"],
                 state_label=state_label,
                 surface_root=surface_root,
                 observations=observations,
-                start=int(chosen["start"]),
-                stop=int(chosen["stop"]),
-                track_id=int(chosen["track_id"]),
-                lifetime_hours=float(chosen["lifetime_hours"]),
-                criterion=criterion,
+                start=int(item["start"]),
+                stop=int(item["stop"]),
+                track_id=int(item["track_id"]),
+                lifetime_hours=float(item["lifetime_hours"]),
+                criterion=item_criterion,
+                coast_buffer_m=coast_buffer_m,
+                variant=variant,
             )
+
+        snapshot = _prepare(chosen, criterion, "main") if chosen is not None else None
         paths.extend(
             example_figures.render_snapshot_figures(
                 output_dir,
@@ -1440,6 +1779,7 @@ def _render_site_wp_h_figures(
                 "n_candidates": len(born_records),
                 "selection_min_lifetime_hours": float(max(lifetime_thresholds)),
                 "criterion": criterion,
+                "null_p99_lifetime_hours": null_p99,
             }
         )
         if snapshot is not None:
@@ -1455,8 +1795,37 @@ def _render_site_wp_h_figures(
                     "detection_index": snapshot.detection_index,
                     "recomputed_core_offset_cells": snapshot.core_offset_cells,
                     "source_month_dir": snapshot.source_month_dir,
+                    "mean_coast_distance_m": snapshot.mean_coast_m,
+                    "coastal": snapshot.is_coastal,
                 }
             )
+        coastal_record: dict[str, Any] = {"status": "none"}
+        if has_coast:
+            coastal_choice = select_coastal_track(born_records, float(coast_buffer_m))
+            if coastal_choice is not None:
+                coastal_snapshot = _prepare(coastal_choice, "coastal_longest", "coastal")
+                paths.extend(
+                    example_figures.render_coastal_example(
+                        output_dir,
+                        figure_data,
+                        coastal_snapshot,
+                        font_selection=font_selection,
+                        coastline=coastline,
+                        state_label=state_label,
+                        param_id=param_id,
+                        period_label=period_label,
+                        nominal_step_hours=nominal_step_hours,
+                    )
+                )
+                coastal_record = {
+                    "status": "ok",
+                    "track_id": coastal_snapshot.track_id,
+                    "lifetime_hours": coastal_snapshot.lifetime_hours,
+                    "n_observations": coastal_snapshot.n_observations,
+                    "mean_coast_distance_m": coastal_snapshot.mean_coast_m,
+                    "recomputed_core_offset_cells": coastal_snapshot.core_offset_cells,
+                }
+        record["example_coastal"] = coastal_record
     return {"paths": paths, "manifest": record}
 
 
@@ -1490,6 +1859,12 @@ def run_aggregate(args: argparse.Namespace) -> int:
     _require(long_track_hours > 0.0, "--long-track-hours 必須為正值")
     surface_root_raw = getattr(args, "surface_root", None)
     surface_root = Path(surface_root_raw) if surface_root_raw else None
+    coastal_buffer_km = float(getattr(args, "coastal_buffer_km", None) or COASTAL_BUFFER_KM)
+    _require(coastal_buffer_km > 0.0 and np.isfinite(coastal_buffer_km), "--coastal-buffer-km 必須為正值")
+    coast_buffer_m = coastal_buffer_km * 1000.0
+    _require(coast_buffer_m < COAST_DISTANCE_CAP_M, f"--coastal-buffer-km 必須小於近岸距離場飽和上限 {COAST_DISTANCE_CAP_M / 1000.0:g} km")
+    prop_min_obs_raw = getattr(args, "prop_min_obs", None)
+    prop_min_obs = max(PROP_MIN_OBS, int(PROP_MIN_OBS if prop_min_obs_raw is None else prop_min_obs_raw))
 
     track_root = Path(args.track_root)
     detect_root = Path(args.detect_root)
@@ -1595,6 +1970,8 @@ def run_aggregate(args: argparse.Namespace) -> int:
         grids[domain_id] = grid
         domain_masks[domain_id] = _build_domain_masks(domain_id, grid, design, study_design_path)
     site_mask = {site_id: mask for masks in domain_masks.values() for site_id, mask in masks.items()}
+    for domain_id in present_domains:
+        ensure_observation_coast(domain_context[domain_id], grids[domain_id])
 
     # --- 時間置換 null 對照組：驗證設定一致，並以與真實相同的規則取各站未截尾壽命 ---------------
     null_runs: list[dict[str, Any]] = []
@@ -1602,6 +1979,7 @@ def run_aggregate(args: argparse.Namespace) -> int:
         seed_value: int | None = None
         per_site_lifetimes: dict[str, list[float]] = {}
         per_site_born: dict[str, list[float]] = {}
+        per_site_records: dict[str, dict[str, list[Any]]] = {}
         domain_records: dict[str, dict[str, str]] = {}
         for domain_id in present_domains:
             _require((null_root / domain_id).is_dir(), f"--null-track-root 缺少 domain {domain_id}: {null_root}")
@@ -1612,13 +1990,23 @@ def run_aggregate(args: argparse.Namespace) -> int:
             domain_seed = int(null_loaded["manifest"]["null_model"]["seed"])
             _require(seed_value is None or seed_value == domain_seed, f"{null_root} 各 domain 的 shuffle seed 不一致")
             seed_value = domain_seed
-            per_site_lifetimes.update(_track_lifetimes_by_site(null_loaded, domain_masks[domain_id], grids[domain_id]))
-            per_site_born.update(_born_uncensored_lifetimes_by_site(null_loaded, domain_masks[domain_id], grids[domain_id]))
+            ensure_observation_coast(null_loaded, grids[domain_id])
+            null_records = _null_track_records_by_site(null_loaded, domain_masks[domain_id], grids[domain_id], coast_buffer_m)
+            per_site_records.update(null_records)
+            per_site_lifetimes.update({site: rec["lifetimes"] for site, rec in null_records.items()})
+            per_site_born.update({site: rec["born_lifetimes"] for site, rec in null_records.items()})
             manifest_path = null_root / domain_id / "manifest.json"
             domain_records[domain_id] = {"manifest_path": str(manifest_path), "manifest_sha256": _sha256_file(manifest_path)}
         assert seed_value is not None
         null_runs.append(
-            {"root": null_root, "seed": seed_value, "lifetimes": per_site_lifetimes, "born_lifetimes": per_site_born, "domains": domain_records}
+            {
+                "root": null_root,
+                "seed": seed_value,
+                "lifetimes": per_site_lifetimes,
+                "born_lifetimes": per_site_born,
+                "records": per_site_records,
+                "domains": domain_records,
+            }
         )
     null_seeds = [run["seed"] for run in null_runs]
     _require(len(set(null_seeds)) == len(null_seeds), f"--null-track-root 的 shuffle seed 重複: {null_seeds}")
@@ -1642,6 +2030,7 @@ def run_aggregate(args: argparse.Namespace) -> int:
             thresholds_sinv=thresholds_sinv,
             site_accumulators=site_accumulators,
             spatial_accumulators=spatial_accumulators,
+            coast_buffer_m=coast_buffer_m,
         )
         _process_track_lifetimes(
             context=domain_context[domain_id],
@@ -1651,6 +2040,8 @@ def run_aggregate(args: argparse.Namespace) -> int:
             spatial_accumulators=spatial_accumulators,
             evolution_min_hours=evolution_min_hours,
             long_track_hours=long_track_hours,
+            prop_min_obs=prop_min_obs,
+            coast_buffer_m=coast_buffer_m,
         )
 
     # --- 站點面積 -------------------------------------------------------------------
@@ -1672,6 +2063,7 @@ def run_aggregate(args: argparse.Namespace) -> int:
         shape = grids[domain_id]["shape"]
         cell_area_m2 = grids[domain_id]["cell_area_m2"]
         mask = site_mask[site_id]
+        buffer_cells = np.asarray(grids[domain_id]["coast_distance_m"]) < coast_buffer_m
         strata_acc = spatial_accumulators[site_id]
         spatial_by_stratum = {
             "all": _sum_spatial_accumulators(shape, [strata_acc[s] for s in SEASONS if s in strata_acc]),
@@ -1690,7 +2082,9 @@ def run_aggregate(args: argparse.Namespace) -> int:
         for stratum in sorted(set(ordered) | {"all", *SEASONS}):
             accumulator = spatial_by_stratum.get(stratum) or _new_spatial_accumulator(shape)
             finalized = _finalize_spatial(shape, accumulator)
-            hotspot = _site_hotspots(accumulator, finalized, mask, cell_area_m2, hotspot_quantile, hotspot_min_cells)
+            hotspot = _site_hotspots(
+                accumulator, finalized, mask, cell_area_m2, hotspot_quantile, hotspot_min_cells, coast_buffer_mask=buffer_cells
+            )
             site_spatial[site_id][stratum] = _mask_to_site(finalized, mask)
             site_hotspots[site_id][stratum] = hotspot
             hotspot_metrics_by_stratum[stratum] = hotspot["metrics"]
@@ -1709,6 +2103,7 @@ def run_aggregate(args: argparse.Namespace) -> int:
                     bootstrap_reps=int(args.bootstrap_reps),
                     rng=rng,
                     lifetime_thresholds_hours=lifetime_thresholds,
+                    coast_buffer_km=coastal_buffer_km,
                 )
             )
             if track_core_filter is not None:
@@ -1717,12 +2112,31 @@ def run_aggregate(args: argparse.Namespace) -> int:
                 record.update(
                     _null_columns(record, [run["lifetimes"].get(site_id, []) for run in null_runs], lifetime_thresholds)
                 )
+                null_sets_by_group = {
+                    group: [
+                        [
+                            value
+                            for value, coastal in zip(
+                                run["records"][site_id]["lifetimes"], run["records"][site_id]["coastal"], strict=True
+                            )
+                            if coastal == (group == "coastal")
+                        ]
+                        if site_id in run["records"]
+                        else []
+                        for run in null_runs
+                    ]
+                    for group in COAST_GROUPS
+                }
+                record.update(_null_group_columns(record, null_sets_by_group, lifetime_thresholds))
             records.append(record)
     _write_site_statistics(output_dir, records, lifetime_thresholds, with_null=bool(null_runs), track_core_filter=track_core_filter)
 
     # --- 逐站 spatial npz ------------------------------------------------------------
     for site_id in sites_present:
         grid = grids[site_domain[site_id]]
+        coast_field = np.asarray(grid["coast_distance_m"])
+        site_coast_distance = np.where(site_mask[site_id], coast_field, np.nan).astype(np.float32)
+        site_buffer_mask = site_mask[site_id] & (coast_field < coast_buffer_m)
         for stratum in ("all", *SEASONS):
             hotspot = site_hotspots[site_id][stratum]
             threshold = site_thresholds[site_id]["threshold_sinv"]
@@ -1740,6 +2154,9 @@ def run_aggregate(args: argparse.Namespace) -> int:
                     np.nan if hotspot["metrics"]["hotspot_threshold_curve_pass_frequency"] is None else hotspot["metrics"]["hotspot_threshold_curve_pass_frequency"]
                 ),
                 hotspot_threshold_core_frequency=np.float64(np.nan if hotspot["core_threshold"] is None else hotspot["core_threshold"]),
+                coast_distance_m=site_coast_distance,
+                coast_buffer_mask=site_buffer_mask,
+                coast_buffer_m=np.float64(coast_buffer_m),
                 **site_spatial[site_id][stratum],
             )
 
@@ -1781,6 +2198,28 @@ def run_aggregate(args: argparse.Namespace) -> int:
                 lifetimes_all=list(all_accumulator["track_lifetimes_all"]),
                 null_lifetimes=[list(run["lifetimes"].get(site_id, [])) for run in null_runs],
                 lifetime_scope_text=scope_text,
+                coast_distance_m=grid["coast_distance_m"],
+                coast_buffer_km=coastal_buffer_km,
+                coastal=aggregate_figures.CoastalDiagnosticData(
+                    buffer_km=coastal_buffer_km,
+                    hist_edges_km=COAST_HIST_EDGES_KM,
+                    hist_all=all_accumulator["coast_hist_all"],
+                    hist_strong=all_accumulator["coast_hist_strong"],
+                    hist_long=all_accumulator["coast_hist_long"],
+                    lifetimes_offshore=list(all_accumulator["track_lifetimes_offshore"]),
+                    lifetimes_coastal=list(all_accumulator["track_lifetimes_coastal"]),
+                    null_offshore=[
+                        [v for v, c in zip(run["records"][site_id]["lifetimes"], run["records"][site_id]["coastal"], strict=True) if not c]
+                        for run in null_runs
+                        if site_id in run["records"]
+                    ],
+                    null_coastal=[
+                        [v for v, c in zip(run["records"][site_id]["lifetimes"], run["records"][site_id]["coastal"], strict=True) if c]
+                        for run in null_runs
+                        if site_id in run["records"]
+                    ],
+                    nominal_step_hours=domain_step_hours[site_domain[site_id]],
+                ),
                 lifetime_thresholds_hours=lifetime_thresholds,
                 nominal_step_hours=domain_step_hours[site_domain[site_id]],
                 evolution_mean_day=evolution_mean_day,
@@ -1808,9 +2247,7 @@ def run_aggregate(args: argparse.Namespace) -> int:
                 domain_id=site_domain[site_id],
                 grid=grid,
                 born_records=all_accumulator["born_uncensored"],
-                prop_cx=all_accumulator["prop_cx_kmday"],
-                prop_cy=all_accumulator["prop_cy_kmday"],
-                prop_track_n=int(all_accumulator["prop_track_n"]),
+                prop_tracks=all_accumulator["prop_tracks"],
                 null_runs=null_runs,
                 long_track_hours=long_track_hours,
                 lifetime_thresholds=lifetime_thresholds,
@@ -1823,6 +2260,7 @@ def run_aggregate(args: argparse.Namespace) -> int:
                 state_label=shared["state_label"],
                 param_id=shared["param_id"],
                 period_label=period_label,
+                coast_buffer_m=coast_buffer_m,
             )
             figure_paths.extend(site_extra["paths"])
             wp_h_manifest[site_id] = site_extra["manifest"]
@@ -1861,6 +2299,27 @@ def run_aggregate(args: argparse.Namespace) -> int:
         "lifetime_thresholds_hours": lifetime_thresholds,
         "lifetime_evolution_min_hours": evolution_min_hours,
         "long_track_hours": long_track_hours,
+        "coastal_buffer_km": coastal_buffer_km,
+        "coast_distance": {
+            "definition": "distance from point to nearest cell centre that is not analysis ocean (in-grid only)",
+            "cap_m": COAST_DISTANCE_CAP_M,
+            "coastal_track_rule": "track mean core coast distance < buffer",
+            "computed_from_mask_domains": [d for d in present_domains if grids[d].get("coast_distance_computed")],
+            "offshore_strong_threshold": "unchanged (site-wide strong-core quantile threshold)",
+        },
+        "propagation": {
+            "method": "per-track least-squares linear fit of refined core x(t), y(t)",
+            "min_observations": prop_min_obs,
+            "stationary_rule": "fitted displacement over track duration < 1 grid cell",
+            "stationary_cell_m": {d: grid_cell_size_m(grids[d]) for d in present_domains},
+        },
+        "core_subgrid": {
+            "method": shared["detection_config"].get("core_subgrid", "none"),
+            "refine": bool(shared["detection_config"].get("core_subgrid_refine", False)),
+        },
+        "shard_schema_versions": {
+            d: sorted({m.get("schema_version") for m in domain_context[d]["shard_manifests"].values()}) for d in present_domains
+        },
         "example_figures_enabled": example_figures_enabled,
         "surface_root_override": None if surface_root is None else str(surface_root),
         "site_track_figures": wp_h_manifest,
@@ -1970,6 +2429,15 @@ def register_subcommands(subparsers: argparse._SubParsersAction) -> None:
         "--surface-root", type=Path, default=None,
         help="OCM ocm_surface 根目錄（含 <domain_id>/months、<domain_id>/grid）；未指定時重開 OCM 使用 shard manifest 記錄的"
         "來源路徑，路徑搬移後以此覆寫（仍核對 metadata 與海岸遮罩 SHA-256）",
+    )
+    aggregate.add_argument(
+        "--coastal-buffer-km", type=float, default=COASTAL_BUFFER_KM, metavar="KM",
+        help="近岸緩衝帶寬度（km，預設 3）：核心距最近非分析海域格點小於此值視為近岸；驅動近岸比例、近岸外（offshore）"
+        "統計、近岸型／近岸外 track 分類與各地圖上的虛線緩衝帶",
+    )
+    aggregate.add_argument(
+        "--prop-min-obs", type=int, default=PROP_MIN_OBS, metavar="N",
+        help="傳播速度線性擬合所需的最少觀測數（預設且下限為 3）",
     )
     aggregate.add_argument("--bootstrap-reps", type=int, default=1_000)
     aggregate.add_argument("--seed", type=int, default=20_260_928)

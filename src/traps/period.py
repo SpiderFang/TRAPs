@@ -54,7 +54,13 @@ from .tracking import (
     densify_polyline,
 )
 
-SHARD_SCHEMA_VERSION = "traps.period.shard.v1"
+SHARD_SCHEMA_VERSION = "traps.period.shard.v2"
+LEGACY_SHARD_SCHEMA_VERSIONS = ("traps.period.shard.v1",)
+ACCEPTED_SHARD_SCHEMA_VERSIONS = (SHARD_SCHEMA_VERSION, *LEGACY_SHARD_SCHEMA_VERSIONS)
+"""v2 新增次網格核心與近岸距離欄位；v1 shard 仍可讀，缺欄位以格點節點／即時計算補齊。"""
+
+COAST_DISTANCE_CAP_M = 30_000.0
+"""近岸距離場的飽和上限（m）；超過此距離的格點記為此值（近岸診斷只需數 km 至數十 km）。"""
 TRACK_SCHEMA_VERSION = "traps.period.track.v1"
 
 DEFAULT_PROGRESS_INTERVAL_SNAPSHOTS = 48
@@ -155,6 +161,99 @@ def curve_pass_cells(
     nx = int(mask_shape[1])
     flat = rows * np.int64(nx) + cols
     return np.unique(flat)
+
+
+def compute_coast_distance_field(
+    ocean_mask: np.ndarray,
+    x_axis_m: np.ndarray,
+    y_axis_m: np.ndarray,
+    *,
+    cap_m: float = COAST_DISTANCE_CAP_M,
+    row_block: int = 128,
+) -> np.ndarray:
+    """回傳每個格點中心到最近「非分析海域」格點中心的歐氏距離（m，float32）。
+
+    非分析海域指 ``ocean_mask=False`` 的格點（陸地、海岸排除區、靜態無效），只計算
+    格網內的格點；格網外不視為陸地。演算法為精確的兩段式距離轉換：先對每欄沿 y
+    以雙向掃描得到同欄最近非海域格點的垂直距離 ``g``，再對每個格點在 ±S 欄內取
+    ``min(g² + Δx²)``（S 由 ``cap_m`` 與格距決定）。距離超過 ``cap_m`` 者飽和為
+    ``cap_m``；其餘為精確值。非海域格點自身距離為 0。網格內完全沒有非海域格點時，
+    全場為 ``cap_m``。純 numpy、分區塊計算以限制記憶體。
+    """
+
+    mask = np.asarray(ocean_mask, dtype=bool)
+    x_axis = np.asarray(x_axis_m, dtype=np.float64)
+    y_axis = np.asarray(y_axis_m, dtype=np.float64)
+    ny, nx = mask.shape
+    _require(x_axis.shape == (nx,) and y_axis.shape == (ny,), "近岸距離場的座標軸長度必須與遮罩一致")
+    cap = float(cap_m)
+    non_ocean = ~mask
+    if not np.any(non_ocean):
+        return np.full(mask.shape, cap, dtype=np.float32)
+
+    # 垂直方向：最近非海域格點的 |Δy|，向上與向下各掃一次（座標軸可為遞增或遞減）。
+    vertical = np.full(mask.shape, np.inf, dtype=np.float64)
+    last_y = np.full(nx, np.nan, dtype=np.float64)
+    for row in range(ny):
+        last_y = np.where(non_ocean[row], y_axis[row], last_y)
+        seen = np.isfinite(last_y)
+        vertical[row] = np.where(seen, np.abs(y_axis[row] - last_y), np.inf)
+    last_y = np.full(nx, np.nan, dtype=np.float64)
+    for row in range(ny - 1, -1, -1):
+        last_y = np.where(non_ocean[row], y_axis[row], last_y)
+        seen = np.isfinite(last_y)
+        vertical[row] = np.minimum(vertical[row], np.where(seen, np.abs(y_axis[row] - last_y), np.inf))
+    vertical = np.minimum(vertical, cap)
+    vertical_sq = vertical * vertical
+
+    min_dx = float(np.min(np.abs(np.diff(x_axis)))) if nx > 1 else cap
+    shift_limit = int(min(nx - 1, np.ceil(cap / max(min_dx, 1.0e-9))))
+    result = np.empty(mask.shape, dtype=np.float32)
+    for start in range(0, ny, row_block):
+        block = vertical_sq[start : start + row_block]
+        best = block.copy()
+        for shift in range(1, shift_limit + 1):
+            # 欄 j 與欄 j±shift 的 x 距離（各欄可不同，支援非等距軸）。
+            left = np.abs(x_axis[shift:] - x_axis[:-shift]) ** 2  # 長度 nx-shift
+            np.minimum(best[:, shift:], block[:, :-shift] + left[None, :], out=best[:, shift:])
+            np.minimum(best[:, :-shift], block[:, shift:] + left[None, :], out=best[:, :-shift])
+        result[start : start + row_block] = np.minimum(np.sqrt(best), cap)
+    result[non_ocean] = 0.0
+    return result
+
+
+def sample_coast_distance(
+    field: np.ndarray, x_axis_m: np.ndarray, y_axis_m: np.ndarray, x_m: np.ndarray, y_m: np.ndarray
+) -> np.ndarray:
+    """在 ``(y, x)`` 距離場上以雙線性內插取樣；格網外的點回傳 NaN。"""
+
+    x_axis = np.asarray(x_axis_m, dtype=np.float64)
+    y_axis = np.asarray(y_axis_m, dtype=np.float64)
+    xs = np.atleast_1d(np.asarray(x_m, dtype=np.float64))
+    ys = np.atleast_1d(np.asarray(y_m, dtype=np.float64))
+
+    def _bracket(axis: np.ndarray, values: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        increasing = axis[-1] > axis[0]
+        ordered = axis if increasing else axis[::-1]
+        inside = np.isfinite(values) & (values >= ordered[0]) & (values <= ordered[-1])
+        index = np.clip(np.searchsorted(ordered, values, side="right") - 1, 0, ordered.size - 2)
+        span = ordered[index + 1] - ordered[index]
+        frac = np.clip((values - ordered[index]) / span, 0.0, 1.0)
+        if not increasing:
+            index = ordered.size - 2 - index
+            frac = 1.0 - frac
+        return index, frac, inside
+
+    col, tx, inside_x = _bracket(x_axis, xs)
+    row, ty, inside_y = _bracket(y_axis, ys)
+    data = np.asarray(field, dtype=np.float64)
+    value = (
+        data[row, col] * (1.0 - tx) * (1.0 - ty)
+        + data[row, col + 1] * tx * (1.0 - ty)
+        + data[row + 1, col] * (1.0 - tx) * ty
+        + data[row + 1, col + 1] * tx * ty
+    )
+    return np.where(inside_x & inside_y, value, np.nan)
 
 
 def _atomic_write_npz(path: Path, **arrays: np.ndarray) -> Path:
@@ -417,6 +516,9 @@ def run_detect_shards(args: argparse.Namespace) -> int:
     det_core_col: list[int] = []
     det_core_x_m: list[float] = []
     det_core_y_m: list[float] = []
+    det_core_grid_x_m: list[float] = []
+    det_core_grid_y_m: list[float] = []
+    det_core_refined: list[bool] = []
     det_core_s1_sinv: list[float] = []
     det_curve_length_m: list[float] = []
     det_curve_mean_s1_sinv: list[float] = []
@@ -474,6 +576,9 @@ def run_detect_shards(args: argparse.Namespace) -> int:
             det_core_col.append(int(detection.core_index_ij[1]))
             det_core_x_m.append(float(detection.core_xy_m[0]))
             det_core_y_m.append(float(detection.core_xy_m[1]))
+            det_core_grid_x_m.append(float(detection.core_grid_xy_m[0]))
+            det_core_grid_y_m.append(float(detection.core_grid_xy_m[1]))
+            det_core_refined.append(bool(detection.core_refined))
             det_core_s1_sinv.append(float(detection.core_s1_sinv))
             det_curve_length_m.append(float(detection.curve_length_m))
             det_curve_mean_s1_sinv.append(float(detection.curve_mean_s1_sinv))
@@ -547,6 +652,18 @@ def run_detect_shards(args: argparse.Namespace) -> int:
     )
     assert total_curve_points == curve_points_m.shape[0]
 
+    assert grid_arrays is not None
+    # 近岸距離場每個 domain 只需算一次（同一 shard 內僅依 analysis_ocean_mask 與座標軸）。
+    coast_distance_m = compute_coast_distance_field(
+        grid_arrays["analysis_ocean_mask"], grid_arrays["x_m_axis"], grid_arrays["y_m_axis"]
+    )
+    grid_arrays["coast_distance_m"] = coast_distance_m
+    det_core_x_array = np.asarray(det_core_x_m, dtype=np.float64)
+    det_core_y_array = np.asarray(det_core_y_m, dtype=np.float64)
+    det_coast_distance = sample_coast_distance(
+        coast_distance_m, grid_arrays["x_m_axis"], grid_arrays["y_m_axis"], det_core_x_array, det_core_y_array
+    )
+
     _atomic_write_npz(
         output_dir / "detections.npz",
         snapshot_index=np.asarray(det_snapshot_index, dtype=np.int64),
@@ -554,8 +671,12 @@ def run_detect_shards(args: argparse.Namespace) -> int:
         detection_index=np.asarray(det_detection_index, dtype=np.int64),
         core_row=np.asarray(det_core_row, dtype=np.int64),
         core_col=np.asarray(det_core_col, dtype=np.int64),
-        core_x_m=np.asarray(det_core_x_m, dtype=np.float64),
-        core_y_m=np.asarray(det_core_y_m, dtype=np.float64),
+        core_x_m=det_core_x_array,
+        core_y_m=det_core_y_array,
+        core_grid_x_m=np.asarray(det_core_grid_x_m, dtype=np.float64),
+        core_grid_y_m=np.asarray(det_core_grid_y_m, dtype=np.float64),
+        core_refined=np.asarray(det_core_refined, dtype=bool),
+        core_coast_distance_m=det_coast_distance.astype(np.float64),
         core_s1_sinv=np.asarray(det_core_s1_sinv, dtype=np.float64),
         curve_length_m=np.asarray(det_curve_length_m, dtype=np.float64),
         curve_mean_s1_sinv=np.asarray(det_curve_mean_s1_sinv, dtype=np.float64),
@@ -570,7 +691,6 @@ def run_detect_shards(args: argparse.Namespace) -> int:
         pass_cells=pass_cells,
     )
 
-    assert grid_arrays is not None
     _atomic_write_npz(output_dir / "grid_reference.npz", **grid_arrays)
 
     source = _source_provenance(month, study_design_path)
@@ -593,6 +713,12 @@ def run_detect_shards(args: argparse.Namespace) -> int:
             "end_time_utc_ns": time_utc_ns_col[-1] if time_utc_ns_col else None,
         },
         "stop_code_table": STOP_REASON_CODES,
+        "core_subgrid": config.core_subgrid if config.core_subgrid_refine else "none",
+        "coast_distance": {
+            "definition": "distance from point to nearest cell centre that is not analysis ocean (in-grid only)",
+            "cap_m": COAST_DISTANCE_CAP_M,
+            "sampling": "bilinear",
+        },
         "runtime_seconds": runtime_seconds,
         "created_at_utc": _datetime.datetime.now(_datetime.UTC).isoformat(timespec="seconds"),
         "package_version": _package_version(),
@@ -670,7 +796,10 @@ def _load_shard(shards_root: Path, month: str) -> tuple[dict[str, Any], dict[str
     manifest = _success_verified(shard_dir)
     if manifest is None:
         raise ValueError(f"shard 未完成或驗證失敗（缺少 _SUCCESS 或 SHA-256 不符）: {shard_dir}")
-    _require(manifest.get("schema_version") == SHARD_SCHEMA_VERSION, f"shard schema_version 不符: {shard_dir}")
+    _require(
+        manifest.get("schema_version") in ACCEPTED_SHARD_SCHEMA_VERSIONS,
+        f"shard schema_version 不受支援（需要 {ACCEPTED_SHARD_SCHEMA_VERSIONS}）: {shard_dir}",
+    )
     _require(manifest.get("month") == month, f"shard month 與目錄名稱不符: {shard_dir}")
     snapshots_path = shard_dir / "snapshots.npz"
     with np.load(snapshots_path) as archive:
@@ -962,6 +1091,12 @@ def _rebuild_qualified_detections(
         detection = TrapDetection(
             core_index_ij=(int(detections["core_row"][row]), int(detections["core_col"][row])),
             core_xy_m=(float(detections["core_x_m"][row]), float(detections["core_y_m"][row])),
+            core_grid_xy_m=(
+                (float(detections["core_grid_x_m"][row]), float(detections["core_grid_y_m"][row]))
+                if "core_grid_x_m" in detections
+                else None
+            ),
+            core_refined=bool(detections["core_refined"][row]) if "core_refined" in detections else False,
             core_s1_sinv=float(detections["core_s1_sinv"][row]),
             curve_points_m=points,
             curve_s1_sinv=strengths,
@@ -1031,6 +1166,15 @@ def run_track_period(args: argparse.Namespace) -> int:
         shard_dirs[month] = shard_dir
     _validate_shard_consistency(manifests, domain_id=domain_id)
 
+    # 近岸距離場：v2 shard 已存於 grid_reference.npz；v1 shard 則由 analysis_ocean_mask 即時計算。
+    with np.load(shard_dirs[available_months[0]] / "grid_reference.npz") as archive:
+        coast_x_axis = np.array(archive["x_m_axis"])
+        coast_y_axis = np.array(archive["y_m_axis"])
+        if "coast_distance_m" in archive.files:
+            coast_field = np.array(archive["coast_distance_m"])
+        else:
+            coast_field = compute_coast_distance_field(np.array(archive["analysis_ocean_mask"]), coast_x_axis, coast_y_axis)
+
     first_manifest = manifests[available_months[0]]
     param_id = args.param_id or first_manifest.get("param_id")
     state_label = first_manifest.get("state_label")
@@ -1071,7 +1215,7 @@ def run_track_period(args: argparse.Namespace) -> int:
         _require(0.0 < strong_quantile < 1.0, "--track-strong-quantile 必須介於 0 與 1 之間（不含端點）")
         core_filter_design_path = Path(getattr(args, "study_design", None) or DEFAULT_STUDY_DESIGN_PATH)
         with np.load(shard_dirs[available_months[0]] / "grid_reference.npz") as archive:
-            grid_reference = {name: np.array(archive[name]) for name in archive.files}
+            grid_reference = {name: np.array(archive[name]) for name in archive.files if name != "coast_distance_m"}
         filter_site_masks = _domain_site_masks(domain_id, grid_reference, core_filter_design_path)
         _require(bool(filter_site_masks), f"研究設計中 {domain_id} 沒有任何研究站，無法套用 --track-strong-quantile")
         core_filter_thresholds = _compute_track_core_thresholds(shard_dirs, canonical, filter_site_masks, strong_quantile)
@@ -1209,6 +1353,13 @@ def run_track_period(args: argparse.Namespace) -> int:
         core_x_m=np.asarray(obs_core_x_col, dtype=np.float64)[obs_order],
         core_y_m=np.asarray(obs_core_y_col, dtype=np.float64)[obs_order],
         core_s1_sinv=np.asarray(obs_core_s1_col, dtype=np.float64)[obs_order],
+        core_coast_distance_m=sample_coast_distance(
+            coast_field,
+            coast_x_axis,
+            coast_y_axis,
+            np.asarray(obs_core_x_col, dtype=np.float64),
+            np.asarray(obs_core_y_col, dtype=np.float64),
+        )[obs_order],
     )
 
     tracks_csv_path = output_dir / "tracks.csv"
@@ -1429,6 +1580,9 @@ __all__ = [
     "STOP_REASON_CODES",
     "STOP_CODE_TO_REASON",
     "SHARD_SCHEMA_VERSION",
+    "ACCEPTED_SHARD_SCHEMA_VERSIONS",
+    "compute_coast_distance_field",
+    "sample_coast_distance",
     "TRACK_SCHEMA_VERSION",
     "curve_pass_cells",
     "register_subcommands",

@@ -77,6 +77,11 @@ class DetectionConfig:
     smoothing_diffusion_alpha: float = 0.5
     # 供 manifest 明確指出這不是未帶遮罩的 Gaussian normalized convolution。
     smoothing_method: str = "four_neighbor_graph_diffusion"
+    # 是否以 3x3 有效 stencil 的二維二次曲面擬合，把核心從格點提升到次網格位置。
+    # 關閉時核心位置退回格點節點（與 v1 行為相同）。
+    core_subgrid_refine: bool = True
+    # 供 manifest 明確記錄次網格核心定位方法；固定值，不可由使用者改寫。
+    core_subgrid: str = "quadratic_3x3"
 
     def __post_init__(self) -> None:
         """驗證門檻，及早拒絕會產生無法解讀結果的設定。"""
@@ -126,6 +131,10 @@ class DetectionConfig:
             raise ValueError("smoothing_diffusion_alpha 必須落在 (0, 1] 之間")
         if self.smoothing_method != "four_neighbor_graph_diffusion":
             raise ValueError("smoothing_method 固定為 four_neighbor_graph_diffusion")
+        if not isinstance(self.core_subgrid_refine, (bool, np.bool_)):
+            raise ValueError("core_subgrid_refine 必須是布林值")
+        if self.core_subgrid != "quadratic_3x3":
+            raise ValueError("core_subgrid 固定為 quadratic_3x3")
 
     @property
     def min_core_separation_m(self) -> float:
@@ -162,6 +171,10 @@ class TrapDetection:
     backward_stop_reason: str
     is_qualified: bool
     qc_flags: tuple[str, ...] = field(default_factory=tuple)
+    # 核心所在的格點節點座標；未提供時等於 ``core_xy_m``（舊版建構相容）。
+    core_grid_xy_m: tuple[float, float] | None = None
+    # ``core_xy_m`` 是否為次網格二次擬合後的位置（False 代表仍是格點節點）。
+    core_refined: bool = False
 
     def __post_init__(self) -> None:
         """固定曲線陣列形狀與唯讀狀態，避免下游破壞檢出證據。"""
@@ -174,6 +187,14 @@ class TrapDetection:
         if len(xy) != 2 or not all(np.isfinite(value) for value in xy):
             raise ValueError("core_xy_m 必須是兩個有限公尺座標")
         object.__setattr__(self, "core_xy_m", xy)
+        if self.core_grid_xy_m is None:
+            grid_xy = xy
+        else:
+            grid_xy = tuple(float(value) for value in self.core_grid_xy_m)
+            if len(grid_xy) != 2 or not all(np.isfinite(value) for value in grid_xy):
+                raise ValueError("core_grid_xy_m 必須是兩個有限公尺座標")
+        object.__setattr__(self, "core_grid_xy_m", grid_xy)
+        object.__setattr__(self, "core_refined", bool(self.core_refined))
 
         points = _freeze_array(self.curve_points_m, dtype=np.float64)
         strengths = _freeze_array(self.curve_s1_sinv, dtype=np.float64)
