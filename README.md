@@ -129,7 +129,7 @@ python -m traps aggregate \
 ```
 
 `aggregate`（`$TRACK_ROOT`／`$SHARDS_ROOT` 各自是四個 domain 子目錄的容器）是第三
-階段，計算五站全期出現率、核心吸引強度與 track 壽命統計，並輸出逐格空間分布：
+階段，逐站獨立計算五站全期出現率、核心吸引強度、track 壽命與熱點統計，並輸出各站逐格空間分布與圖組：
 
 `detect-shards` 對單一 domain-month 流式呼叫 `detect_snapshot`，寫出精簡的
 `snapshots.npz`（逐時 coverage／detection 計數與 packbits 化 valid mask）、
@@ -156,32 +156,51 @@ domain，缺席站點會明列於 manifest），核對四區共用同一組 `par
 `PILOT_ONLY` 與正式資料混用），並重新核對每個 shard manifest 的 SHA-256（偵測
 `track-period` 完成後 shard 被竄改的情況）。
 
-站點統計分兩種空間範圍（`scope`）：`receptor`（PRIMARY，站點 anchor 12.5 km
-半徑 × `analysis_ocean_mask`；A 區貢寮／龜山島兩站 receptor 互斥）與
-`domain_partition`（沿用 `site_masks()` 的舊定義，即完整 flow-domain 的
-Voronoi／整域分割，作為對照）。每個 `site_id × scope × stratum`
-（`stratum` 為 `all`、四季 `DJF/MAM/JJA/SON`、以及實際出現的年份）輸出
-`site_statistics.csv`／`site_statistics.json`：有效快照分母、核心／強核心／曲線
-出現率與分子（強核心門檻是跨四區 pooled 核心 `s1` 的 `--strong-quantile`
-分位數，預設最強 10%，以 s⁻¹ 與 day⁻¹ 記入 manifest）、`mean_pass_cell_fraction`
-（三個出現率與此欄位均以 day-block bootstrap 給 95% CI）、核心強度統計
-（count/mean/median/p10）、面積標準化核心密度，以及未截尾 track 的壽命統計
-（mean/median/p90，`lifetime_seconds = duration_seconds + Δt`，與
-`track-period` 的 track 壽命慣例一致；track 依其首個落在遮罩內的觀測時間指派
-stratum）。`spatial/<domain>/spatial_<all|DJF|MAM|JJA|SON>.npz` 額外保留逐格
-（不分站點）的有效分母、核心／強核心頻率、曲線通過率、平均核心強度與平均未截尾
-壽命；沒有有效分母的格點固定是 `NaN`，不假裝是零。
+五個研究站彼此**獨立**，`aggregate` 不做跨站比較，也不跨站 pooled 任何門檻或色階。
+每個站的統計範圍是它自己的「站點分析區」（`scope = site_area`）：直接沿用
+`sites.site_masks()` 對 `analysis_ocean_mask` 的 flow-domain 分割，B／C／D 為整個
+flow domain 的分析海域，A 區由貢寮與龜山島依最近 anchor 互斥分割；不使用任何接收區
+半徑。每個 `site_id × stratum`（`stratum` 為 `all`、四季 `DJF/MAM/JJA/SON`、以及實際
+出現的年份）輸出 `site_statistics.csv`／`site_statistics.json`：有效快照分母（站點
+分析區內有效格點比例達 `min_coverage` 的 canonical 快照）、核心／強核心／曲線出現率
+與分子（**強核心門檻是該站自己**分析區內、canonical `coverage_pass` 快照的合格核心
+`s1` 的 `--strong-quantile` 分位數，預設最強 10%，各站門檻以 s⁻¹ 與 day⁻¹ 記入
+manifest 的 `strong_core_thresholds` 與統計表）、`mean_pass_cell_fraction`（三個出現率
+與此欄位均以 day-block bootstrap 給 95% CI）、核心強度統計（count/mean/median/p10）、
+面積標準化核心密度、未截尾 track 的壽命統計（mean/median/p90，
+`lifetime_seconds = duration_seconds + Δt`，與 `track-period` 的 track 壽命慣例一致；
+track 依其首個落在該站分析區內的觀測時間指派 stratum），以及熱點指標：熱點＝該站
+分析區內 `curve_pass_frequency` 最高 `1 - --hotspot-quantile`（預設前 10%）的格點，
+輸出 `hotspot_threshold_curve_pass_frequency`、`hotspot_cell_count`、`hotspot_area_km2`、
+熱點內平均曲線通過頻率、熱點內平均核心 s1（day⁻¹）、以及該站強核心落在熱點格點的
+比例（每個分層各自以該分層的場定義熱點）。
 
-`--no-figures` 可略過圖面只留統計表；預設另外輸出 `five_site_summary.png`
-（receptor scope、全期，三個出現率含 CI、核心強度與壽命摘要）、
-`seasonal_occurrence.png`（逐站四季分組長條圖）、`lifetime_distribution.png`
-（逐站 track 壽命 CCDF，未截尾實線、含截尾虛線）與每區一張
-`spatial_<domain>.png`（曲線通過率、核心頻率、平均核心強度、平均壽命四分圖，
-海岸線疊圖與色條對齊沿用既有 `coastline.py`／`colorbar_layout.py`；四區色階
-上下限取全域 2–98 百分位共用，並記錄於 manifest 供比較）。輸出目錄同樣必須是
-新的或空的（或 `--resume`），manifest schema 為 `traps.period.aggregate.v1`。
-所有輸出仍保留輸入的 `state_label`／科學狀態，圖說與 JSON 一律標示
-「MODEL_ONLY 表層短期吸引潛勢」或 `PILOT_ONLY`，不是實測海廢濃度或污染來源。
+`spatial/<site_id>/spatial_<all|DJF|MAM|JJA|SON>.npz` 保留該站分析區內的逐格有效分母、
+核心／強核心頻率、曲線通過頻率、平均核心強度與平均未截尾壽命（站外與沒有有效分母的
+格點固定是 `NaN`，不假裝是零），並包含 `site_mask`、`hotspot_curve_mask`、
+`hotspot_core_mask` 與各門檻。
+
+`--no-figures` 可略過圖面只留統計表；預設每站輸出一組五張圖到
+`figures/<site_id>/`：`site_<id>_spatial.png`（站點分析區內 2×2：曲線通過頻率、核心
+頻率、平均核心 s1、平均未截尾壽命；只標 anchor，不畫圓）、`site_<id>_hotspots.png`
+（曲線通過頻率場上標出熱點格點，疊加核心頻率前 10% 的輪廓，標題與註腳註明熱點面積
+km²）、`site_<id>_seasonal.png`（DJF/MAM/JJA/SON 曲線通過頻率小圖，以及季節強核心
+出現率與平均通過格點比例含 95% CI）、`site_<id>_lifetime.png`（壽命 CCDF，未截尾實線、
+含截尾虛線；以及壽命 ≥ 12 h 未截尾 track 的平均核心 s1（day⁻¹）對正規化年齡 0–1
+的演化，Kunz et al. 2024 Fig. 5b 風格，標示 track 數）、`site_<id>_timeseries.png`
+（逐日含強核心的有效快照比例與平均通過格點比例，30 日滑動平均，資料缺口以斷線呈現）。
+各圖色階上下限是該站自己分析區的 2–98 百分位（記錄於 manifest `colour_limits`），
+海岸線疊圖與色條對齊沿用既有 `coastline.py`／`colorbar_layout.py`。
+
+圖面文字為繁體中文，字型由 `report_font.resolve_cjk_font()` 依固定順序
+（Noto Sans CJK TC、Noto Sans TC、Source Han Sans TC、PingFang TC、Heiti TC、
+Arial Unicode MS）解析，並以 FreeType charmap 檢查涵蓋圖面所有固定文字與五站名稱；
+選定字型的家族、檔名 basename 與檔案 SHA-256 記入 manifest `font`，也印在每張圖註腳。
+找不到合格 CJK 字型時 `aggregate` 在寫任何檔案前以 `ValueError` 停止（圖面絕不輸出
+方框字）；改用 `--no-figures` 則不需要字型。輸出目錄同樣必須是新的或空的（或
+`--resume`），manifest schema 為 `traps.period.aggregate.v2`。所有輸出仍保留輸入的
+`state_label`／科學狀態，圖說與 JSON 一律標示「MODEL_ONLY 表層短期吸引潛勢」或
+`PILOT_ONLY`，不是實測海廢濃度或污染來源。
 
 ## 目前產物、驗證與限制
 

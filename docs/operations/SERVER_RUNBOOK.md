@@ -256,13 +256,28 @@ $VENV_PY -m traps aggregate \
 
 讀入四個 domain 的 `track-period` 輸出，核對四區共用同一組 `param_id`、
 `detection_config`、`tracking_config`、`min_coverage`、`state_label`（拒絕
-`PILOT_ONLY` 與正式資料混用），並重新核對每個 shard manifest 的 SHA-256。輸出
-五站 `site_statistics.csv`／`.json`（`receptor`／`domain_partition` 兩種空間範圍
-× `all`／四季／年份分層的出現率、核心強度、壽命統計）、`spatial/<domain>/` 逐格
-分布 `.npz`，以及五站摘要、季節、壽命 CCDF 與逐區空間四分圖 PNG。log 在
+`PILOT_ONLY` 與正式資料混用），並重新核對每個 shard manifest 的 SHA-256。五個研究站
+彼此獨立：強核心門檻（`--strong-quantile`，預設 0.10）、熱點（`--hotspot-quantile`，
+預設 0.90）與圖面色階都只用該站自己的資料；統計範圍是各站的站點分析區
+（`scope = site_area`，B／C／D 為整個 flow domain 的分析海域，A 區貢寮／龜山島依
+`site_masks` 分割）。輸出（schema `traps.period.aggregate.v2`）：
+
+- `site_statistics.csv`／`.json`：五站 × `all`／四季／年份分層的出現率、核心強度、
+  壽命與熱點指標（熱點門檻、格數、面積 km² 等）；
+- `spatial/<site_id>/spatial_<all|DJF|MAM|JJA|SON>.npz`：站內逐格分布、站點與熱點遮罩；
+- `figures/<site_id>/site_<site_id>_{spatial,hotspots,seasonal,lifetime,timeseries}.png`：
+  每站一組五張圖；
+- `manifest.json`：各站強核心門檻（`strong_core_thresholds`）、各站色階、`font`
+  （字型家族、檔名、SHA-256）。
+
+圖面文字為繁體中文，需要系統有 Noto Sans CJK TC（本伺服器
+`/usr/share/fonts/opentype/noto/NotoSansCJK-*.ttc`）或候選清單中的其他字型；
+`aggregate` 會先以 FreeType charmap 檢查字元涵蓋，找不到合格字型即在寫檔前以
+`ValueError` 失敗（不會輸出方框字），此時可安裝字型後重跑，或在指令加
+`--no-figures` 先取得統計表。log 在
 `$TRAPS_RUNS/runs/$TRAPS_PARAM_ID/logs/aggregate.log`。預估耗時：讀入全部
-shard／track artifact 與逐月流式統計為主要成本，量級與 TRACK 相近（數十分鐘），
-實際隨資料量與 `--bootstrap-reps` 變動。
+shard／track artifact 與逐月流式統計為主要成本，量級與 TRACK 相近（數十分鐘；前次
+全期實測約 8 分鐘），實際隨資料量與 `--bootstrap-reps` 變動。
 
 ## 如何在失敗後續跑（resume）
 
