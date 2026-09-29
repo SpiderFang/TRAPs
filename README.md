@@ -149,6 +149,25 @@ python -m traps aggregate \
 `tracking_summary.json` 與 schema `traps.period.track.v1` 的 `manifest.json`
 （含 canonical-axis 統計、缺口清單、逐份 shard manifest 的 SHA-256）。
 
+#### Null model：時間置換（`--shuffle-seed`）
+
+日平均去潮汐場上每個 snapshot 的核心密度高、最近鄰間距僅數 km，而追蹤門檻（核心
+≤10 km、曲線 Hausdorff ≤20 km）相近，track 可能只是不相干核心的串接。
+`track-period --shuffle-seed INT` 保留 canonical 時間軸、availability／coverage 與缺口，
+但把每個可用槽位的偵測換成種子決定、僅在可用 snapshot 間置換的另一個 snapshot（
+`detection_keys` 仍指向真實來源）。manifest 與 `tracking_summary.json` 記錄
+`null_model: {"type": "time_shuffle", "seed": s}`；每次執行另輸出
+`lifetime_hist.json`（未截尾壽命的名目步數計數與截尾數）。**`aggregate` 會拒絕**任何
+`null_model` 非空的 track 輸入。比較用：
+
+```bash
+python scripts/null_test_tracking.py --output-dir "$OUT" \
+  --runs real="$TRACK_REAL" shuf1="$TRACK_SEED1" shuf2="$TRACK_SEED2"
+```
+
+輸出 `comparison.csv`（含 `coherence_ratio` ＝ 真實 frac(壽命≥3 步) ÷ 置換平均）與逐
+domain 壽命 CCDF 的 `comparison.png`；比值接近 1 代表 track 壽命與隨機串接無異。
+
 前兩階段輸出的欄位命名與陣列 schema 是為 `aggregate` 保留的完整證據鏈；`aggregate`
 讀入所有 4 個 domain 的 `track-period` 輸出（`--allow-partial-domains` 可放寬為部分
 domain，缺席站點會明列於 manifest），核對四區共用同一組 `param_id`、

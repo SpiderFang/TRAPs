@@ -143,6 +143,10 @@ def _load_track_domain(track_root: Path, domain_id: str) -> dict[str, Any]:
     assert manifest is not None
     _require(manifest.get("schema_version") == TRACK_SCHEMA_VERSION, f"{domain_id} track manifest schema_version 不符")
     _require(manifest.get("domain_id") == domain_id, f"{domain_id} track manifest domain_id 不符")
+    _require(
+        manifest.get("null_model") is None,
+        f"{domain_id} track manifest 含 null_model（{manifest.get('null_model')}）：null 對照組不可餵入統計",
+    )
     with np.load(domain_dir / "canonical_snapshots.npz") as archive:
         canonical = {name: np.array(archive[name]) for name in archive.files}
     with np.load(domain_dir / "track_observations.npz") as archive:

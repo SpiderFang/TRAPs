@@ -78,7 +78,13 @@ STOP_CODE_TO_REASON: dict[int, str] = {code: reason for reason, code in STOP_REA
 _SHARD_ARTIFACT_NAMES = ("snapshots.npz", "detections.npz", "grid_reference.npz")
 _SHARD_KNOWN_FILES = (*_SHARD_ARTIFACT_NAMES, "manifest.json", "manifest.sha256", "_SUCCESS")
 
-_TRACK_ARTIFACT_NAMES = ("canonical_snapshots.npz", "track_observations.npz", "tracks.csv", "tracking_summary.json")
+_TRACK_ARTIFACT_NAMES = (
+    "canonical_snapshots.npz",
+    "track_observations.npz",
+    "tracks.csv",
+    "tracking_summary.json",
+    "lifetime_hist.json",
+)
 _TRACK_KNOWN_FILES = (*_TRACK_ARTIFACT_NAMES, "manifest.json", "manifest.sha256", "_SUCCESS")
 
 
@@ -823,6 +829,19 @@ def _rebuild_qualified_detections(
     return result
 
 
+def _time_shuffle_source_rows(coverage_pass: np.ndarray, seed: int) -> np.ndarray:
+    """回傳每個 canonical 槽位的偵測來源列；僅在 ``coverage_pass`` 為真的槽位間做隨機置換。
+
+    不可用槽位維持指向自己（實際不會被讀取），可用槽位 ``avail[k]`` 取用 ``perm[k]``。
+    """
+
+    source = np.arange(coverage_pass.shape[0], dtype=np.int64)
+    available = np.nonzero(coverage_pass)[0]
+    rng = np.random.default_rng(int(seed))
+    source[available] = rng.permutation(available)
+    return source
+
+
 def run_track_period(args: argparse.Namespace) -> int:
     """讀入一個 domain 的多個月份 shard，建立正式研究期時間軸並跨月份追蹤。"""
 
@@ -894,6 +913,16 @@ def run_track_period(args: argparse.Namespace) -> int:
     )
     tracker = StreamingTracker(tracking_config)
 
+    # null model：保留 canonical 時間軸與 availability，僅把可用槽位的偵測結果換成
+    # 隨機置換後的另一個可用 snapshot 的偵測（detection_keys 仍指向真實來源 snapshot）。
+    shuffle_seed = getattr(args, "shuffle_seed", None)
+    null_model: dict[str, Any] | None = None
+    source_row = np.arange(int(canonical["time_utc_ns"].shape[0]), dtype=np.int64)
+    if shuffle_seed is not None:
+        null_model = {"type": "time_shuffle", "seed": int(shuffle_seed)}
+        source_row = _time_shuffle_source_rows(np.asarray(canonical["coverage_pass"], dtype=bool), int(shuffle_seed))
+    detections_cache: dict[str, dict[str, np.ndarray]] = {}
+
     completed_summaries: list[Any] = []
     current_month: str | None = None
     current_detections: dict[str, np.ndarray] | None = None
@@ -930,9 +959,19 @@ def run_track_period(args: argparse.Namespace) -> int:
             completed_summaries.extend(tracker.push(TrackingFrame(time_utc_ns=time_utc_ns, available=False)))
         else:
             assert current_detections is not None
-            qualified = _rebuild_qualified_detections(current_detections, snapshot_index)
+            if null_model is None:
+                src_month, src_snapshot, src_detections = month_value, snapshot_index, current_detections
+            else:
+                src = int(source_row[row])
+                src_month = f"{int(canonical['month'][src]):06d}"
+                src_snapshot = int(canonical["snapshot_index"][src])
+                if src_month not in detections_cache:
+                    with np.load(shard_dirs[src_month] / "detections.npz") as archive:
+                        detections_cache[src_month] = {name: np.array(archive[name]) for name in archive.files}
+                src_detections = detections_cache[src_month]
+            qualified = _rebuild_qualified_detections(src_detections, src_snapshot)
             frame_detections = tuple(detection for _, detection in qualified)
-            detection_keys = tuple((month_value, snapshot_index, detection_index) for detection_index, _ in qualified)
+            detection_keys = tuple((src_month, src_snapshot, detection_index) for detection_index, _ in qualified)
             frame = TrackingFrame(time_utc_ns=time_utc_ns, detections=frame_detections, available=True)
             completed_summaries.extend(tracker.push(frame, detection_keys=detection_keys))
 
@@ -961,6 +1000,7 @@ def run_track_period(args: argparse.Namespace) -> int:
     censored_count = 0
     uncensored_count = 0
     uncensored_lifetimes: list[float] = []
+    nominal_step_seconds = float(args.nominal_time_step_hours) * 3_600.0
 
     for summary in sorted(completed_summaries, key=lambda item: item.track_id):
         record = summary.to_record()
@@ -1051,8 +1091,22 @@ def run_track_period(args: argparse.Namespace) -> int:
             "p75": _quantile_or_none(uncensored_lifetimes, 0.75),
             "p90": _quantile_or_none(uncensored_lifetimes, 0.90),
         },
+        "null_model": null_model,
     }
     _atomic_write_json(output_dir / "tracking_summary.json", tracking_summary)
+
+    # 未截尾壽命以名目步數（四捨五入）計數，並附截尾 track 數，方便不讀 tracks.csv 直接比較。
+    steps = [max(1, int(round(value / nominal_step_seconds))) for value in uncensored_lifetimes]
+    max_steps = max(steps) if steps else 0
+    lifetime_hist = {
+        "unit": "nominal_steps",
+        "nominal_time_step_hours": float(args.nominal_time_step_hours),
+        "counts": {str(k): int(steps.count(k)) for k in range(1, max_steps + 1)},
+        "uncensored_count": len(steps),
+        "censored_count": censored_count,
+        "null_model": null_model,
+    }
+    _atomic_write_json(output_dir / "lifetime_hist.json", lifetime_hist)
 
     shard_manifest_records = [
         {
@@ -1071,6 +1125,7 @@ def run_track_period(args: argparse.Namespace) -> int:
         "domain_id": domain_id,
         "state_label": state_label,
         "tracking_config": tracking_config.to_manifest_dict(),
+        "null_model": null_model,
         "nominal_time_step_hours": float(args.nominal_time_step_hours),
         "requested_months": requested_months,
         "available_months": available_months,
@@ -1152,6 +1207,12 @@ def register_subcommands(subparsers: argparse._SubParsersAction) -> None:
     track_period.add_argument("--nominal-time-step-hours", type=float, default=1.0)
     track_period.add_argument("--allow-missing-months", action="store_true")
     track_period.add_argument("--resume", action="store_true")
+    track_period.add_argument(
+        "--shuffle-seed",
+        type=int,
+        default=None,
+        help="null model：以此種子置換可用 snapshot 的偵測（保留時間軸與缺口），破壞時間連續性；輸出不得餵給 aggregate",
+    )
     track_period.set_defaults(handler=run_track_period)
 
     # Stage 3（跨月份／跨區彙整）在獨立模組 aggregate.py 實作；這裡只新增掛載，
