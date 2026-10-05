@@ -1,5 +1,7 @@
 # TRAPs：表層瞬態吸引剖面分析
 
+> **成果報告**：方法與實作見 [`docs/reports/01_TRAPs_實作方式報告.md`](docs/reports/01_TRAPs_實作方式報告.md)，2024–2025 年五站執行成果見 [`docs/reports/02_TRAPs_執行成果報告.md`](docs/reports/02_TRAPs_執行成果報告.md)；索引與引用方式見 [`docs/reports/`](docs/reports/README.md)，文件總覽見 [`docs/README.md`](docs/README.md)。
+
 本專案延續 `OCM-SVD-Analysis` 的流場分析與 `Lagrangian-Ensemble-Backtracking` 的五站研究設計，研究表層二維流場中的瞬態吸引剖面（Transient Attracting Profiles, TRAPs）。原始需求保存於 [`data/工項2.pdf`](data/工項2.pdf)，方法與成果圖的文獻原件、紅框導讀副本及來源清冊保存於 [`data/literature/`](data/literature/README.md)。
 
 ## 研究邊界與來源權威
@@ -41,7 +43,7 @@ TRAP 描述瞬時流場的短期吸引結構。只有模型流場時，成果應
 | [`src/traps/coastline.py`](src/traps/coastline.py) | 驗證使用者提供的 CRS84 GeoJSON 陸地 polygon 與 SHA-256，供地理座標圖及局部公尺圖畫海岸線；**僅供視覺呈現**，不更動檢出遮罩。 |
 | [`src/traps/colorbar_layout.py`](src/traps/colorbar_layout.py) | 在 Matplotlib 完成等比例主圖排版後，以主圖實際 axes 上下界對齊所屬色條；僅處理成果圖版面。 |
 
-`catalog.json` 保留原始公尺制曲線及逐時／站點分母；`catalog.geojson` 將同一曲線轉成 WGS84 經緯度。每個成果目錄須是新的或空的，以免舊圖與新參數混在同一份 manifest。單區 catalog 的域外站點雖保留零面積 schema，摘要圖只顯示該區有效站點；`summary` 可把**相同 UTC 時刻、相同檢出參數**的四區 catalog 合併為五站比較。跨月份同站點聚合與跨月份 track 接續目前尚未實作，因此不同月份不可直接交給 `summary` 當作完整壽命分析。完整[模組流程圖與文獻圖型對照](docs/MODULE_FLOW_AND_FIGURE_AUDIT.md)包含條件資料的拒絕路徑。
+`catalog.json` 保留原始公尺制曲線及逐時／站點分母；`catalog.geojson` 將同一曲線轉成 WGS84 經緯度。每個成果目錄須是新的或空的，以免舊圖與新參數混在同一份 manifest。單區 catalog 的域外站點雖保留零面積 schema，摘要圖只顯示該區有效站點；`summary` 可把**相同 UTC 時刻、相同檢出參數**的四區 catalog 合併為五站比較。跨月份同站點聚合與跨月份 track 接續目前尚未實作，因此不同月份不可直接交給 `summary` 當作完整壽命分析。完整[模組流程圖與文獻圖型對照](docs/archive/MODULE_FLOW_AND_FIGURE_AUDIT.md)包含條件資料的拒絕路徑。
 
 ### 本機安裝與驗證
 
@@ -73,11 +75,11 @@ python -m traps detect \
 
 ### 海岸線圖面資料
 
-使用者提供的 [`taiwan_exact_coastline.geojson`](data/taiwan_exact_coastline/taiwan_exact_coastline.geojson) 是 CRS84 的陸地 polygon；其[來源、授權與雜湊說明](data/taiwan_exact_coastline/README.md)已留存。圖面以它畫海岸輪廓，預設由專案 `data/taiwan_exact_coastline/` 讀取，亦可用 `--coastline-geojson` 指向其他已驗證的檔案。圖說須標示 © OpenStreetMap contributors／ODbL。此檔沒有高程或水深，且不取代 `--ocean-mask` 的格點 sidecar；數值檢出與分母仍依原有遮罩。資料讀取、繪圖及遮罩的關係見[模組流程圖](docs/MODULE_FLOW_AND_FIGURE_AUDIT.md)。
+使用者提供的 [`taiwan_exact_coastline.geojson`](data/taiwan_exact_coastline/taiwan_exact_coastline.geojson) 是 CRS84 的陸地 polygon；其[來源、授權與雜湊說明](data/taiwan_exact_coastline/README.md)已留存。圖面以它畫海岸輪廓，預設由專案 `data/taiwan_exact_coastline/` 讀取，亦可用 `--coastline-geojson` 指向其他已驗證的檔案。圖說須標示 © OpenStreetMap contributors／ODbL。此檔沒有高程或水深，且不取代 `--ocean-mask` 的格點 sidecar；數值檢出與分母仍依原有遮罩。資料讀取、繪圖及遮罩的關係見[模組流程圖](docs/archive/MODULE_FLOW_AND_FIGURE_AUDIT.md)。
 
 ### 成果圖色條版面
 
-垂直色條須與其對應主圖的**實際座標框同高**；等比例地理圖應在 Matplotlib 完成比例配置後，再對齊色條上下界。雙色條圖的兩條色條均對齊同一主圖。此版面規則參考相鄰 `OCM-SVD-Analysis` 的主圖／色條配置，只調整繪圖幾何，不改色階上下限或科學數值。原本採自動刻度的圖可能隨色條縮短而調整顯示刻度密度，以免標籤重疊；實作與驗收界線見[色條對齊計畫](docs/COLORBAR_ALIGNMENT_PLAN.md)。
+垂直色條須與其對應主圖的**實際座標框同高**；等比例地理圖應在 Matplotlib 完成比例配置後，再對齊色條上下界。雙色條圖的兩條色條均對齊同一主圖。此版面規則參考相鄰 `OCM-SVD-Analysis` 的主圖／色條配置，只調整繪圖幾何，不改色階上下限或科學數值。原本採自動刻度的圖可能隨色條縮短而調整顯示刻度密度，以免標籤重疊；實作與驗收界線見[色條對齊計畫](docs/archive/COLORBAR_ALIGNMENT_PLAN.md)。
 
 ### 文獻圖組的本機重現
 
@@ -93,7 +95,7 @@ cd /Users/mustlab/Workspace/TRAPs
   --output-root outputs/pilot/literature_figures_four_area_4frames_v5_colorbar_repro
 ```
 
-正式圖組應另指定正式 catalog 與全期 OCM 資料；四時刻試算只驗證介面與版面。A 區站點統計採最近 anchor 互斥分割，空間圖的母域仍是完整 A flow domain。圖組不跨月份接續 track；`duration_seconds` 是首末檢出觀測跨度。見[文獻實作與驗收記錄](docs/LITERATURE_FIGURE_IMPLEMENTATION_PLAN.md)。
+正式圖組應另指定正式 catalog 與全期 OCM 資料；四時刻試算只驗證介面與版面。A 區站點統計採最近 anchor 互斥分割，空間圖的母域仍是完整 A flow domain。圖組不跨月份接續 track；`duration_seconds` 是首末檢出觀測跨度。見[文獻實作與驗收記錄](docs/archive/LITERATURE_FIGURE_IMPLEMENTATION_PLAN.md)。
 
 ### 條件資料介面與圖型啟用
 
@@ -285,4 +287,6 @@ SERVER 用法見 `docs/operations/SERVER_RUNBOOK.md` 的 DAILY 一節（`TRAPS_F
 
 ## 目前產物、驗證與限制
 
-需求 PDF、四篇文獻原件與紅框副本及來源清冊存於 [`data/literature/`](data/literature/README.md)；程式佇列與驗收界線見 [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md)，[模組流程圖與文獻圖型對照](docs/MODULE_FLOW_AND_FIGURE_AUDIT.md) 逐項標明已可試跑和有資料 gate 的圖型。本機四區各 24 時刻的上游 `trial_partial_month` 用於來源與海岸 sidecar 檢查；四區各取同一 2025-01-01 UTC 四時刻進行檢出，並以[海岸線與等高色條版圖組](outputs/pilot/literature_figures_four_area_4frames_v5_colorbar/figure_availability.json)及[單時刻圖](outputs/pilot/snapshot_a_20250101_t0100_v5_colorbar/snapshot_000000.png)核對 A–D 圖面。這些產物一律是 `PILOT_ONLY` 工程試算，不是 2024–2025 正式 TRAP 統計。全套測試 61 項通過，圖組 27 個 artifact 的 SHA-256 與來源 catalog、研究設計設定雜湊已核對；四區科學摘要 JSON、五站摘要及概念圖和前版位元組一致。正式資料全期計算、跨月份生命週期、跨參數 robust 分類、速度單位確認，以及獨立表層觀測與潮相對照仍未完成；不能據此宣稱海廢濃度或污染來源。
+2024-01 至 2025-12 的全期分析已完成：逐時產品（`r1_hourly`）與 25 h 去潮汐日產品（`d1_daily25h`）各自完成 4 個流場區域 × 24 個月的偵測、追蹤與五站彙整（程式版本 `99c3151`），全套測試 254 項通過。方法與實作見 [`docs/reports/01_TRAPs_實作方式報告.md`](docs/reports/01_TRAPs_實作方式報告.md)，成果、圖與限制見 [`docs/reports/02_TRAPs_執行成果報告.md`](docs/reports/02_TRAPs_執行成果報告.md)；索引與引用方式見 [`docs/reports/README.md`](docs/reports/README.md)。早期 `PILOT_ONLY` 試算文件已歸檔於 [`docs/archive/`](docs/archive/IMPLEMENTATION_PLAN.md)，不代表目前結果。
+
+限制：結果僅來自模型流場（`MODEL_ONLY`），沒有獨立的漂流器或海廢觀測驗證，只能稱為「表層短期吸引潛勢」，不得寫成海廢濃度、長期滯留、海底廢聚集或污染來源；日產品壽命的 2–3 天部分可由隨機串接解釋，近岸 2–3 km 內存在檢出下限。

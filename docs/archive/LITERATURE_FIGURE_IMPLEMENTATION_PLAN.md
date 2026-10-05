@@ -4,7 +4,7 @@
 
 ## 研究與資料邊界
 
-- 四區域、五站點與 A 區最近 anchor 分割沿用 [`configs/study_design.json`](../configs/study_design.json)；C 區顯示南灣，上游 domain ID 不變。
+- 四區域、五站點與 A 區最近 anchor 分割沿用 [`configs/study_design.json`](../../configs/study_design.json)；C 區顯示南灣，上游 domain ID 不變。
 - 可立即由已存在的 OCM/TRAP 試算資料驗證：原創機制示意、單時刻方法比較、逐格空間分布與通過次數、完整／截尾分開的壽命分布和生命週期圖。所有試算圖標 `PILOT_ONLY`；少量時刻不推論季節、熱區或長壽命。
 - 潮相、大／小潮、獨立漂流器與海廢清理紀錄先做明示資料契約、時間／站點／單位／來源與品質檢查。沒有通過檢查的資料時，輸出 `DATA_REQUIRED`／`QC_BLOCKED` 狀態和缺項，不輸出空白、補值或合成的科學結果圖。相鄰 SVD 專案雖保存 CWA 潮位原始檔，尚未確立它們與本 TRAP 五站的潮相指派契約，不能直接繪製條件分層結果。
 - 與文獻的「漂流器停留時間」相關圖須使用真正獨立的表層觀測和可查核來源；共用 OCM 流場的 Lagrangian 軌跡只能標成模型內部機制比較。物體停留時間與 TRAP 結構壽命分開。
@@ -32,4 +32,4 @@
 
 ## 最終驗收
 
-使用合成資料驗證空間分子／分母、分層 gate、觀測距離、粒子群凸包面積比及截尾；本機 2025-01-01 四區四時刻圖組見 [`outputs/pilot/literature_figures_four_area_4frames_v3/`](../outputs/pilot/literature_figures_four_area_4frames_v3/figure_availability.json)。最終執行須目視檢查各圖、核對 manifest SHA-256 與缺觀測／潮相時的 `DATA_REQUIRED`；圖組仍需完整 2024–2025 資料及獨立表層觀測，才能形成正式研究結論。
+使用合成資料驗證空間分子／分母、分層 gate、觀測距離、粒子群凸包面積比及截尾；本機 2025-01-01 四區四時刻圖組見 [`outputs/pilot/literature_figures_four_area_4frames_v3/`](../../outputs/pilot/literature_figures_four_area_4frames_v3/figure_availability.json)。最終執行須目視檢查各圖、核對 manifest SHA-256 與缺觀測／潮相時的 `DATA_REQUIRED`；圖組仍需完整 2024–2025 資料及獨立表層觀測，才能形成正式研究結論。

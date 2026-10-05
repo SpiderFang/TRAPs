@@ -21,5 +21,5 @@
 ## 2026-09-23 整合驗收
 
 - 共用 helper 已接入單時刻圖、方法比較圖兩個色階、空間四分圖四個色階及海廢／TRAP 共現圖兩個色階。測試以實際 Matplotlib axes 與輸出 PNG 量測等比例圖、constrained layout 與雙色條圖，上下界誤差均在 0.5 point 內；另核對已完成 layout 後色條水平位置與寬度維持不變。全套 pytest 61 項與修改程式 Ruff 檢查通過。
-- [四區四時刻 v5 圖組](../outputs/pilot/literature_figures_four_area_4frames_v5_colorbar/figure_availability.json)與[A 區單時刻 v5 圖](../outputs/pilot/snapshot_a_20250101_t0100_v5_colorbar/snapshot_000000.png)已重產，代表性 A、C、D 圖及合成雙色條海廢圖已目視核對。圖組 27 個 artifact SHA-256 全部相符；四區 `spatial_summary_metadata.json`、`lifetime_summary.json`、五站摘要與概念示意和 v4 位元組一致。
+- [四區四時刻 v5 圖組](../../outputs/pilot/literature_figures_four_area_4frames_v5_colorbar/figure_availability.json)與[A 區單時刻 v5 圖](../../outputs/pilot/snapshot_a_20250101_t0100_v5_colorbar/snapshot_000000.png)已重產，代表性 A、C、D 圖及合成雙色條海廢圖已目視核對。圖組 27 個 artifact SHA-256 全部相符；四區 `spatial_summary_metadata.json`、`lifetime_summary.json`、五站摘要與概念示意和 v4 位元組一致。
 - 新色條高度可能使 Matplotlib 自動 locator 減少可見刻度，避免短色條文字相疊；此為顯示層改變，未改 `vmin/vmax` 或資料。缺少合格外部海廢、漂流器與潮相資料的正式條件圖仍受既有 `DATA_REQUIRED` gate 限制。
