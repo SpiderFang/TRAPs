@@ -1,5 +1,7 @@
 # 文獻圖型實作與驗收計畫
 
+> 註：本文以 `路徑` 純文字標示的檔案（如 outputs/、data/literature/original/、data/literature/annotated/、docs/assets/ 等）僅存於本機，未納入版本控制。
+
 決策與實作日期：2026-09-23。使用者要求將已蒐集文獻的成果呈現方式納入本專案。此處的「納入」指採用圖型所表達的研究問題、分圖與定量比較，使用本專案 TRAP 變數重新製圖；不將 Ghosh 等人的 FTLE 當成 TRAP，也不複製原文圖像或數值。下列一次性佇列均已完成，正式資料門檻仍適用。
 
 ## 研究與資料邊界
@@ -32,4 +34,4 @@
 
 ## 最終驗收
 
-使用合成資料驗證空間分子／分母、分層 gate、觀測距離、粒子群凸包面積比及截尾；本機 2025-01-01 四區四時刻圖組見 [`outputs/_archive/pilot/literature_figures_four_area_4frames_v3/`](../../outputs/_archive/pilot/literature_figures_four_area_4frames_v3/figure_availability.json)。最終執行須目視檢查各圖、核對 manifest SHA-256 與缺觀測／潮相時的 `DATA_REQUIRED`；圖組仍需完整 2024–2025 資料及獨立表層觀測，才能形成正式研究結論。
+使用合成資料驗證空間分子／分母、分層 gate、觀測距離、粒子群凸包面積比及截尾；本機 2025-01-01 四區四時刻圖組見 `outputs/_archive/pilot/literature_figures_four_area_4frames_v3/`（`outputs/_archive/pilot/literature_figures_four_area_4frames_v3/figure_availability.json`）。最終執行須目視檢查各圖、核對 manifest SHA-256 與缺觀測／潮相時的 `DATA_REQUIRED`；圖組仍需完整 2024–2025 資料及獨立表層觀測，才能形成正式研究結論。

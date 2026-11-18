@@ -1,5 +1,7 @@
 # TRAPs 概念與文獻成果圖型交接說明
 
+> 註：本文以 `路徑` 純文字標示的檔案（如 outputs/、data/literature/original/、data/literature/annotated/、docs/assets/ 等）僅存於本機，未納入版本控制。
+
 記錄日期：2026-09-29（Asia/Taipei）  
 專案目錄：`/Users/mustlab/Workspace/TRAPs`  
 交接範圍：保存本次對話中對 TRAPs 專案用途、已發表研究成果、四張文獻原圖，以及補充參考文件的完整說明。
@@ -42,7 +44,7 @@ TRAPs 是瞬態吸引剖面（Transient Attracting Profiles）。可以先把它
 
 本專案也會產生這種「海流底圖＋吸引線」成果。這張圖表示流動結構的位置與短期吸引作用，不能直接解讀為垃圾已在紅線上形成高濃度堆積。
 
-![Kunz 2024 圖 2：TRAP 吸引線、核心與海流](assets/traps_concept_literature_handoff/kunz2024_fig2.png)
+（圖：Kunz 2024 圖 2：TRAP 吸引線、核心與海流，`docs/assets/traps_concept_literature_handoff/kunz2024_fig2.png`）
 
 圖像出處：Kunz et al.（2024），圖 2；原始 PDF 第 4 頁。僅擷取圖面，未修改圖內內容。授權為 CC BY 4.0。
 
@@ -59,7 +61,7 @@ TRAPs 是瞬態吸引剖面（Transient Attracting Profiles）。可以先把它
 | 左下 c | 通過各統計格的 TRAP 路徑數。 | 哪些地方較常有這些結構經過？ |
 | 右下 d | 通過各統計格的 TRAP 路徑平均持續時間。 | 經過此處的結構通常能被追蹤多久？ |
 
-![Kunz 2024 圖 4：吸引強度、移動路徑、通過次數與持續時間](assets/traps_concept_literature_handoff/kunz2024_fig4.png)
+（圖：Kunz 2024 圖 4：吸引強度、移動路徑、通過次數與持續時間，`docs/assets/traps_concept_literature_handoff/kunz2024_fig4.png`）
 
 圖像出處：Kunz et al.（2024），圖 4；原始 PDF 第 9 頁。僅擷取圖面，未修改圖內內容。授權為 CC BY 4.0。
 
@@ -75,7 +77,7 @@ TRAPs 是瞬態吸引剖面（Transient Attracting Profiles）。可以先把它
 - 中圖 b：呈現長時間存在的 TRAP，其吸引作用如何在生命週期中先增強、再減弱；渦旋的比較指標為邊界流速，兩者使用不同縱軸。
 - 右圖 c：比較不同緯度的結構向東或向西移動速度。
 
-![Kunz 2024 圖 5：持續時間、強度演化與移動速度比較](assets/traps_concept_literature_handoff/kunz2024_fig5.png)
+（圖：Kunz 2024 圖 5：持續時間、強度演化與移動速度比較，`docs/assets/traps_concept_literature_handoff/kunz2024_fig5.png`）
 
 圖像出處：Kunz et al.（2024），圖 5；原始 PDF 第 9 頁。僅擷取圖面，未修改圖內內容。授權為 CC BY 4.0。
 
@@ -93,7 +95,7 @@ TRAPs 是瞬態吸引剖面（Transient Attracting Profiles）。可以先把它
 - a、b、c：不同時刻的對照，可以看到漂流器逐漸沿紅線排列。
 - d：與 c 相同時刻，改用水平散度作底圖，並非另一個較晚時刻。
 
-![Serra 2020 圖 4：實測漂流器、TRAP 與不同流場底圖對照](assets/traps_concept_literature_handoff/serra2020_fig4.png)
+（圖：Serra 2020 圖 4：實測漂流器、TRAP 與不同流場底圖對照，`docs/assets/traps_concept_literature_handoff/serra2020_fig4.png`）
 
 圖像出處：Serra et al.（2020），圖 4；原始 PDF 第 4 頁。僅擷取圖面，未修改圖內內容。授權為 CC BY 4.0。
 
@@ -101,7 +103,7 @@ TRAPs 是瞬態吸引剖面（Transient Attracting Profiles）。可以先把它
 
 ## 3. 與補充參考文件的對照
 
-使用者指定的補充文件為 [`/Users/mustlab/Documents/2.docx`](/Users/mustlab/Documents/2.docx)，定位為〈2-5 海洋廢棄物之數值模擬分析〉中的〈三、TRAPs 概念〉。
+使用者指定的補充文件為 `/Users/mustlab/Documents/2.docx`，定位為〈2-5 海洋廢棄物之數值模擬分析〉中的〈三、TRAPs 概念〉。
 
 本次已讀取該節正文與公式，並對照其引用的 Kunz（2024）及 Serra（2020）原文。文件以「從瞬時表層流速找出吸引骨架」說明 TRAP 的核心概念，與上述圖例相符；但以下敘述需要收斂。
 
@@ -130,9 +132,9 @@ TRAPs 是瞬態吸引剖面（Transient Attracting Profiles）。可以先把它
 
 | 來源 | 網頁／DOI | 本機檔案 |
 | --- | --- | --- |
-| Kunz, L., Griesel, A., Eden, C., Duran, R., and Sainte-Rose, B.（2024），*Transient Attracting Profiles in the Great Pacific Garbage Patch*，Ocean Science, 20, 1611–1630。 | [正式文章](https://os.copernicus.org/articles/20/1611/2024/)；[DOI](https://doi.org/10.5194/os-20-1611-2024)。 | [原始 PDF](../data/literature/original/kunz_et_al_2024_traps_gpgp.pdf)。 |
-| Serra, M., et al.（2020），*Search and rescue at sea aided by hidden flow structures*，Nature Communications, 11, 2525。 | [全文](https://pmc.ncbi.nlm.nih.gov/articles/PMC7250873/)；[DOI](https://doi.org/10.1038/s41467-020-16281-x)。 | [原始 PDF](../data/literature/original/serra_et_al_2020_traps_search_rescue.pdf)。 |
-| 使用者補充的 `2.docx`。 | 〈2-5 海洋廢棄物之數值模擬分析／三、TRAPs 概念〉。 | [`/Users/mustlab/Documents/2.docx`](/Users/mustlab/Documents/2.docx)。 |
+| Kunz, L., Griesel, A., Eden, C., Duran, R., and Sainte-Rose, B.（2024），*Transient Attracting Profiles in the Great Pacific Garbage Patch*，Ocean Science, 20, 1611–1630。 | [正式文章](https://os.copernicus.org/articles/20/1611/2024/)；[DOI](https://doi.org/10.5194/os-20-1611-2024)。 | 原始 PDF（`data/literature/original/kunz_et_al_2024_traps_gpgp.pdf`）。 |
+| Serra, M., et al.（2020），*Search and rescue at sea aided by hidden flow structures*，Nature Communications, 11, 2525。 | [全文](https://pmc.ncbi.nlm.nih.gov/articles/PMC7250873/)；[DOI](https://doi.org/10.1038/s41467-020-16281-x)。 | 原始 PDF（`data/literature/original/serra_et_al_2020_traps_search_rescue.pdf`）。 |
+| 使用者補充的 `2.docx`。 | 〈2-5 海洋廢棄物之數值模擬分析／三、TRAPs 概念〉。 | `/Users/mustlab/Documents/2.docx`。 |
 | 專案研究設計與來源界線。 | [README](../README.md)、[文獻來源清冊](../data/literature/README.md)。 | [`configs/study_design.json`](../configs/study_design.json)。 |
 
 ### 5.2 隨本文件保存的四張原圖

@@ -1,5 +1,7 @@
 # GeoJSON 海岸線成果圖整合計畫
 
+> 註：本文以 `路徑` 純文字標示的檔案（如 outputs/、data/literature/original/、data/literature/annotated/、docs/assets/ 等）僅存於本機，未納入版本控制。
+
 決策日期：2026-09-23。使用者將 `data/taiwan_exact_coastline/taiwan_exact_coastline.geojson` 放入本專案。此檔為 CRS84 `FeatureCollection`，含 1,905 個 `Polygon`／`MultiPolygon` feature、1,912 個閉合 ring，SHA-256 為 `9e2e0ac9bc527aca87d89332cd428fdcb776eefbf94a85dd70f887f729b95fdd`。同一雜湊已記錄於相鄰 OCM 前處理專案的 `data/coastline/README.md`，來源為 OSMData land polygons，正式引用需保留 OpenStreetMap／ODbL attribution。
 
 ## 邊界與驗收
@@ -25,5 +27,5 @@
 ## 2026-09-23 整合驗收
 
 - 三項佇列均完成。`load_coastline()` 核對本專案真實檔案為 CRS84、1,905 feature、1,912 ring、151,106 點；CLI 預設載入該檔，並提供 `--coastline-geojson` 顯式覆寫。顯式錯誤來源會拒絕執行，缺少預設檔則於輸出記錄 `default_missing`。
-- [四區四時刻海岸線版試算圖組](../../outputs/_archive/pilot/literature_figures_four_area_4frames_v4_coastline/figure_availability.json)的 A–D 空間四分圖及方法三分圖已逐圖目視核對，C 區顯示為南灣；另產生[A 區單時刻圖](../../outputs/_archive/pilot/snapshot_a_20250101_t0100_v4_coastline/snapshot_000000.png)。全部 27 個圖組 artifact SHA-256 均與 manifest 相符，五站摘要、概念示意及四區 `spatial_summary_metadata.json`、`lifetime_summary.json` 與前版位元組一致。
+- 四區四時刻海岸線版試算圖組（`outputs/_archive/pilot/literature_figures_four_area_4frames_v4_coastline/figure_availability.json`）的 A–D 空間四分圖及方法三分圖已逐圖目視核對，C 區顯示為南灣；另產生A 區單時刻圖（`outputs/_archive/pilot/snapshot_a_20250101_t0100_v4_coastline/snapshot_000000.png`）。全部 27 個圖組 artifact SHA-256 均與 manifest 相符，五站摘要、概念示意及四區 `spatial_summary_metadata.json`、`lifetime_summary.json` 與前版位元組一致。
 - 全套 pytest 57 項通過；最後的地理軸／公尺軸等長驗證加固後，相關 12 項測試通過；修改程式的 Ruff 檢查亦通過。這是 `PILOT_ONLY` 的本機工程驗證，海廢、漂流器與潮相條件圖因無合格輸入仍為 `DATA_REQUIRED`。

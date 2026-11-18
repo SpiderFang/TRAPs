@@ -1,12 +1,14 @@
 # 25 點逐時置中平均之文獻依據與適用範圍
 
+> 註：本文以 `路徑` 純文字標示的檔案（如 outputs/、data/literature/original/、data/literature/annotated/、docs/assets/ 等）僅存於本機，未納入版本控制。
+
 查核日期：2026 年 10 月 14 日。
 
 本紀錄區分文獻所載方法、本專案實作及解析頻率響應。此次僅查核與保存參考資料，未修改流場處理參數、TRAP 檢出、追蹤或既有科學結果。
 
 ## 文獻查核結果
 
-1. **Parker（2007），《Tidal Analysis and Prediction》，NOAA Special Publication NOS CO-OPS 3。**印刷頁 124–125（PDF 第 134–135 頁）直接說明 25 小時移動平均：對逐時資料使用 25 個權重，各為 1/25，可減弱半日潮與日潮訊號；同時明示，對許多應用而言仍殘留過多潮汐能量。印刷頁 127（PDF 第 137 頁）進一步討論箱形濾波器的旁瓣與低頻衰減。來源：[NOAA 典藏](https://repository.library.noaa.gov/view/noaa/50576)；[本地原始 PDF](../data/literature/original/parker_2007_tidal_analysis_prediction.pdf)。下載檔 SHA-256 已核對 NOAA 典藏所列值，見 [補充清冊](../data/literature/tidal_filter_references.json)。
+1. **Parker（2007），《Tidal Analysis and Prediction》，NOAA Special Publication NOS CO-OPS 3。**印刷頁 124–125（PDF 第 134–135 頁）直接說明 25 小時移動平均：對逐時資料使用 25 個權重，各為 1/25，可減弱半日潮與日潮訊號；同時明示，對許多應用而言仍殘留過多潮汐能量。印刷頁 127（PDF 第 137 頁）進一步討論箱形濾波器的旁瓣與低頻衰減。來源：[NOAA 典藏](https://repository.library.noaa.gov/view/noaa/50576)；本地原始 PDF（`data/literature/original/parker_2007_tidal_analysis_prediction.pdf`）。下載檔 SHA-256 已核對 NOAA 典藏所列值，見 補充清冊（`data/literature/tidal_filter_references.json`）。
 2. **California Department of Water Resources，VTools 濾波技術文件。**「Filters」段明確提出：逐時資料可使用 25 個值的箱形平均，使其頻率響應較接近約 24.8 小時的月潮週期；同頁區分單次箱形平均與完整 Godin 濾波，並說明殘留潮汐在每日取樣後可能造成混疊。此資料是政府機關之實作技術文件，不是 TRAP 專屬驗證。來源：[Averaging, Filtering and Low Passing Data](https://cadwrdeltamodeling.github.io/vtools3/html/notebooks/filters.html)。
 3. **Murakami、Morikawa 與 Sakaguchi（1982），Wind Effect and Water Discharge Effect on Constant Flow – Discussion Using Observation Data at Off-Sennan (1978–1981)。**日本港灣研究機構的原始研究摘要將 25 小時移動平均流速向量用於大阪灣流場的背景流變化分析，提供海流應用先例。摘要未逐項列出與本專案相同的置中、時間戳及缺值規則，不宜宣稱完整實作相同。來源：[PARI Report 021-04-01](https://www.pari.go.jp/en/1982/12/1982120210401.html)。
 4. **Walters 與 Heston（1982），Removing tidal-period variations from time-series data using low-pass digital filters，Journal of Physical Oceanography, 12, 112–115。**作者比較潮汐低通濾波器，並指出 Godin 濾波會顯著衰減 2–3 日天氣事件造成的水位變化。本篇支持「抑潮能力與保留短期非潮訊號之間存在取捨」，並不直接證明單次 25 點平均最適合臺灣 TRAP 分析。來源：[USGS 原始論文紀錄與摘要](https://pubs.usgs.gov/publication/70174408)；DOI：10.1175/1520-0485(1982)012<0112:RTPVFT>2.0.CO;2。

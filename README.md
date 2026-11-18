@@ -1,8 +1,10 @@
 # TRAPs：表層瞬態吸引剖面分析
 
-> **成果報告**：方法與實作見 [`outputs/reports/01_TRAPs_實作方式報告.md`](outputs/reports/01_TRAPs_實作方式報告.md)，2024–2025 年五站執行成果見 [`outputs/reports/02_TRAPs_執行成果報告.md`](outputs/reports/02_TRAPs_執行成果報告.md)；索引與引用方式見 [`outputs/reports/`](outputs/reports/README.md)，文件總覽見 [`docs/README.md`](docs/README.md)。
+> 註：本文以 `路徑` 純文字標示的檔案（如 outputs/、data/literature/original/、data/literature/annotated/、docs/assets/ 等）僅存於本機，未納入版本控制。
+
+> **成果報告**：方法與實作見 `outputs/reports/01_TRAPs_實作方式報告.md`，2024–2025 年五站執行成果見 `outputs/reports/02_TRAPs_執行成果報告.md`；索引與引用方式見 `outputs/reports/`（`outputs/reports/README.md`），文件總覽見 [`docs/README.md`](docs/README.md)。
 >
-> **成果集中於 `outputs/`**：報告、彙整結果與分析表皆在 `outputs/`（被 git 忽略，不入版控），各資料夾說明與正式交付檔見 [`outputs/README.md`](outputs/README.md)；`docs/` 只保留方法與操作文件。
+> **成果集中於 `outputs/`**：報告、彙整結果與分析表皆在 `outputs/`（被 git 忽略，不入版控），各資料夾說明與正式交付檔見 `outputs/README.md`；`docs/` 只保留方法與操作文件。
 
 本專案延續 `OCM-SVD-Analysis` 的流場分析與 `Lagrangian-Ensemble-Backtracking` 的五站研究設計，研究表層二維流場中的瞬態吸引剖面（Transient Attracting Profiles, TRAPs）。原始需求保存於 [`data/工項2.pdf`](data/工項2.pdf)，方法與成果圖的文獻原件、紅框導讀副本及來源清冊保存於 [`data/literature/`](data/literature/README.md)。
 
@@ -112,7 +114,7 @@ cd /Users/mustlab/Workspace/TRAPs
 | 同群模型粒子形變代理 | 使用上列 `model_particle` CSV | JSON 另需非空 `patch_id`，明示全表同一釋放群；至少三粒子在兩個以上 catalog 共同 UTC 時刻持續存在且非共線，局部跨度不超過 100 km。產出凸包面積比圖，**不等於** FTLE 或變形梯度。 |
 | 海廢紀錄：`traps.conditional.marine_debris.v1` | `record_id,start_time_utc_ns,end_time_utc_ns,lon,lat,count,effort,qc_pass` | `effort > 0`，單位由 JSON `units` 指明；記錄期間需與 catalog 相交，且至少一筆落在該 flow domain 地理格網內。圖只描述時空共現，不作來源或因果推論。 |
 
-三種 CSV 的 JSON `table_kind` 分別為 `tidal_phase`、`trajectory`、`marine_debris`。各類別實際缺項與拒絕原因見圖組的 [`figure_availability.json`](outputs/_archive/pilot/literature_figures_four_area_4frames_v5_colorbar/figure_availability.json)。若提供四區圖組，潮相 CSV 要涵蓋四區全部有效站點，軌跡與海廢 CSV 則各區分別檢查時間與空間對齊。不可把共用 OCM 強迫的 Lagrangian 模型粒子稱為獨立漂流器驗證。
+三種 CSV 的 JSON `table_kind` 分別為 `tidal_phase`、`trajectory`、`marine_debris`。各類別實際缺項與拒絕原因見圖組的 `outputs/_archive/pilot/literature_figures_four_area_4frames_v5_colorbar/figure_availability.json`。若提供四區圖組，潮相 CSV 要涵蓋四區全部有效站點，軌跡與海廢 CSV 則各區分別檢查時間與空間對齊。不可把共用 OCM 強迫的 Lagrangian 模型粒子稱為獨立漂流器驗證。
 
 ### 全期流程（detect-shards → track-period → aggregate）
 
@@ -302,6 +304,6 @@ SERVER 用法見 `docs/operations/SERVER_RUNBOOK.md` 的 DAILY 一節（`TRAPS_F
 
 ## 目前產物、驗證與限制
 
-2024-01 至 2025-12 的全期分析已完成：逐時產品（`r1_hourly`）與 25 h 去潮汐日產品（`d1_daily25h`）各自完成 4 個流場區域 × 24 個月的偵測、追蹤與五站彙整（程式版本 `0f980cb`（改寫前為 `99c3151`）），全套測試 254 項通過。方法與實作見 [`outputs/reports/01_TRAPs_實作方式報告.md`](outputs/reports/01_TRAPs_實作方式報告.md)，成果、圖與限制見 [`outputs/reports/02_TRAPs_執行成果報告.md`](outputs/reports/02_TRAPs_執行成果報告.md)；索引與引用方式見 [`outputs/reports/README.md`](outputs/reports/README.md)。早期 `PILOT_ONLY` 試算文件已歸檔於 [`docs/archive/`](docs/archive/IMPLEMENTATION_PLAN.md)，不代表目前結果。
+2024-01 至 2025-12 的全期分析已完成：逐時產品（`r1_hourly`）與 25 h 去潮汐日產品（`d1_daily25h`）各自完成 4 個流場區域 × 24 個月的偵測、追蹤與五站彙整（程式版本 `0f980cb`（改寫前為 `99c3151`）），全套測試 254 項通過。方法與實作見 `outputs/reports/01_TRAPs_實作方式報告.md`，成果、圖與限制見 `outputs/reports/02_TRAPs_執行成果報告.md`；索引與引用方式見 `outputs/reports/README.md`。早期 `PILOT_ONLY` 試算文件已歸檔於 [`docs/archive/`](docs/archive/IMPLEMENTATION_PLAN.md)，不代表目前結果。
 
 限制：結果僅來自模型流場（`MODEL_ONLY`），沒有獨立的漂流器或海廢觀測驗證，只能稱為「表層短期吸引潛勢」，不得寫成海廢濃度、長期滯留、海底廢聚集或污染來源；日產品壽命的 2–3 天部分可由隨機串接解釋，近岸 2–3 km 內存在檢出下限。

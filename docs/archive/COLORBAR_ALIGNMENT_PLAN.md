@@ -1,5 +1,7 @@
 # TRAPs 主圖與色條等高規則
 
+> 註：本文以 `路徑` 純文字標示的檔案（如 outputs/、data/literature/original/、data/literature/annotated/、docs/assets/ 等）僅存於本機，未納入版本控制。
+
 決策日期：2026-09-23。使用者要求後續圖表的色條與其對應主圖同高，參考相鄰 `OCM-SVD-Analysis` 繪圖法。該專案 `src/ocm_svd_analysis/water_column_multivariate_svd.py` 的 `align_colorbar_to_map_axis()` 先讓 Matplotlib 完成 `aspect='equal'` 的實際座標框配置，再把色條 axes 的 `y0`、`height` 對齊主圖；其獨立報告版亦以顯式 axes 分欄。TRAPs 採其「以實際 axes 而非 GridSpec 預留欄量測」原則，保留本專案現有版型、座標比例及色階語義。
 
 ## 範圍與驗收
@@ -21,5 +23,5 @@
 ## 2026-09-23 整合驗收
 
 - 共用 helper 已接入單時刻圖、方法比較圖兩個色階、空間四分圖四個色階及海廢／TRAP 共現圖兩個色階。測試以實際 Matplotlib axes 與輸出 PNG 量測等比例圖、constrained layout 與雙色條圖，上下界誤差均在 0.5 point 內；另核對已完成 layout 後色條水平位置與寬度維持不變。全套 pytest 61 項與修改程式 Ruff 檢查通過。
-- [四區四時刻 v5 圖組](../../outputs/_archive/pilot/literature_figures_four_area_4frames_v5_colorbar/figure_availability.json)與[A 區單時刻 v5 圖](../../outputs/_archive/pilot/snapshot_a_20250101_t0100_v5_colorbar/snapshot_000000.png)已重產，代表性 A、C、D 圖及合成雙色條海廢圖已目視核對。圖組 27 個 artifact SHA-256 全部相符；四區 `spatial_summary_metadata.json`、`lifetime_summary.json`、五站摘要與概念示意和 v4 位元組一致。
+- 四區四時刻 v5 圖組（`outputs/_archive/pilot/literature_figures_four_area_4frames_v5_colorbar/figure_availability.json`）與A 區單時刻 v5 圖（`outputs/_archive/pilot/snapshot_a_20250101_t0100_v5_colorbar/snapshot_000000.png`）已重產，代表性 A、C、D 圖及合成雙色條海廢圖已目視核對。圖組 27 個 artifact SHA-256 全部相符；四區 `spatial_summary_metadata.json`、`lifetime_summary.json`、五站摘要與概念示意和 v4 位元組一致。
 - 新色條高度可能使 Matplotlib 自動 locator 減少可見刻度，避免短色條文字相疊；此為顯示層改變，未改 `vmin/vmax` 或資料。缺少合格外部海廢、漂流器與潮相資料的正式條件圖仍受既有 `DATA_REQUIRED` gate 限制。
