@@ -34,6 +34,7 @@ import argparse
 import csv
 import datetime as _datetime
 import json
+import os
 import time as _time
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
@@ -428,6 +429,8 @@ def _new_site_accumulator() -> dict[str, Any]:
         "core_occurrence": 0,
         "strong_core_occurrence": 0,
         "curve_occurrence": 0,
+        "shared_strong_core_total": 0,  # 共用強核心門檻（opt-in）：站內強核心總數
+        "strong_curve_occurrence": 0,  # 共用強核心門檻（opt-in）：站內至少有一格被強核心曲線通過的有效快照數
         "pass_fraction_sum": 0.0,
         "core_count_total": 0,
         "core_s1_values": [],
@@ -462,6 +465,7 @@ def _new_spatial_accumulator(shape: tuple[int, int]) -> dict[str, np.ndarray]:
         "core_count": np.zeros(shape, dtype=np.int64),
         "strong_core_count": np.zeros(shape, dtype=np.int64),
         "curve_pass_count": np.zeros(shape, dtype=np.int64),
+        "strong_curve_pass_count": np.zeros(shape, dtype=np.int64),  # opt-in：只計強核心（共用門檻）延伸出的曲線
         "core_s1_sum": np.zeros(shape, dtype=np.float64),
         "lifetime_count": np.zeros(shape, dtype=np.int64),
         "lifetime_sum": np.zeros(shape, dtype=np.float64),
@@ -491,6 +495,7 @@ def _process_domain(
     site_accumulators: dict[tuple[str, str], dict[str, Any]],
     spatial_accumulators: dict[str, dict[str, dict[str, np.ndarray]]],
     coast_buffer_m: float | None = None,
+    shared_strong_sinv: float | None = None,
 ) -> None:
     """流式處理一個 domain 的每個月份 shard，累加各站 site×stratum 與站內逐格空間統計。
 
@@ -501,6 +506,11 @@ def _process_domain(
     給定 ``coast_buffer_m`` 時另累加近岸診斷：站內核心／強核心落在近岸緩衝帶內的數量、核心距岸直方圖、
     含近岸外強核心的快照數（強核心門檻不重算，仍是該站全部核心的分位數）。核心距岸距離優先讀 v2 shard 的
     ``core_coast_distance_m``；v1 shard 由 ``grid`` 的距離場在核心位置取樣。
+
+    ``shared_strong_sinv`` 給定時（``--shared-strong-core-s1-day``，呼叫端同時把 ``thresholds_sinv`` 全部設為此值），
+    另外累計「強核心曲線」：每條 detection 就是一個核心加上它的 ``pass_cells``（``pass_cell_offsets`` 逐列對應），
+    因此以該列核心 s1 <= 門檻篩出強核心的列，只收集這些列的通過格點。母體與一般曲線一致（任何位置的合格核心，
+    曲線通過格點再限制在站內遮罩）。未給定時完全不累計，行為與舊版相同。
     """
 
     shape = grid["shape"]
@@ -566,6 +576,13 @@ def _process_domain(
 
             cell_values, _row_out = _ragged_gather(det_pass_cell_offsets, rows, det_pass_cells)
             cells_this_snapshot = np.unique(cell_values.astype(np.int64)) if cell_values.size else np.zeros(0, dtype=np.int64)
+            strong_cells_this_snapshot = np.zeros(0, dtype=np.int64)
+            if shared_strong_sinv is not None and rows.size:
+                # 逐列對應：第 i 條 detection 的核心 s1 是 core_s1[i]，其曲線通過格點是 pass_cells[offsets[row]:offsets[row+1]]
+                strong_rows = rows[np.asarray(core_s1, dtype=np.float64) <= shared_strong_sinv]  # NaN s1 -> False
+                strong_values, _strong_row_out = _ragged_gather(det_pass_cell_offsets, strong_rows, det_pass_cells)
+                if strong_values.size:
+                    strong_cells_this_snapshot = np.unique(strong_values.astype(np.int64))
 
             for site_id, mask_flat in flat_masks.items():
                 mask_count = mask_counts[site_id]
@@ -583,6 +600,12 @@ def _process_domain(
                 curve_cells_in_mask = (
                     cells_this_snapshot[mask_flat[cells_this_snapshot]] if cells_this_snapshot.size else cells_this_snapshot
                 )
+                strong_curve_cells_in_mask = (
+                    strong_cells_this_snapshot[mask_flat[strong_cells_this_snapshot]]
+                    if strong_cells_this_snapshot.size
+                    else strong_cells_this_snapshot
+                )
+                has_strong_curve = strong_curve_cells_in_mask.size > 0
                 pass_fraction = float(curve_cells_in_mask.size) / float(mask_count)
                 has_core = site_core_flat.size > 0
                 has_strong = bool(np.any(strong_flags))
@@ -614,6 +637,9 @@ def _process_domain(
                         accumulator["strong_core_occurrence"] += 1
                     if has_curve:
                         accumulator["curve_occurrence"] += 1
+                    if shared_strong_sinv is not None:
+                        accumulator["shared_strong_core_total"] += int(np.count_nonzero(strong_flags))
+                        accumulator["strong_curve_occurrence"] += int(has_strong_curve)
                     accumulator["pass_fraction_sum"] += pass_fraction
                     if coast_buffer_m is not None:
                         accumulator["coast_info"] = True
@@ -643,6 +669,8 @@ def _process_domain(
                             np.add.at(spatial["strong_core_count"].reshape(-1), site_core_flat[strong_flags], 1)
                     if has_curve:
                         spatial["curve_pass_count"].reshape(-1)[curve_cells_in_mask] += 1
+                    if has_strong_curve:
+                        spatial["strong_curve_pass_count"].reshape(-1)[strong_curve_cells_in_mask] += 1
 
 
 # ---------------------------------------------------------------------------
@@ -1385,6 +1413,7 @@ def _finalize_site_record(
     rng: np.random.Generator,
     lifetime_thresholds_hours: Sequence[float] = LIFETIME_THRESHOLD_HOURS,
     coast_buffer_km: float | None = None,
+    shared_strong_s1_day: float | None = None,
 ) -> dict[str, Any]:
     """把一組 site×stratum 累加器轉成 site_statistics 記錄（``scope`` 固定為 site_area）。
 
@@ -1473,6 +1502,20 @@ def _finalize_site_record(
                 )
     record.update(_propagation_columns(accumulator if stratum == "all" else None))
     record.update(hotspot_metrics)
+    if shared_strong_s1_day is not None:
+        core_total = int(accumulator.get("core_count_total", 0))
+        strong_total = int(accumulator.get("shared_strong_core_total", 0))
+        record.update(
+            {
+                "shared_strong_core_s1_day": float(shared_strong_s1_day),
+                "shared_core_count_total": core_total,
+                "shared_strong_core_count_total": strong_total,
+                "shared_strong_core_fraction": (strong_total / core_total) if core_total else None,
+                "shared_strong_core_snapshots": int(accumulator["strong_core_occurrence"]),
+                "shared_strong_core_snapshot_rate": _rate(accumulator["strong_core_occurrence"]),
+                "shared_strong_curve_snapshots": int(accumulator.get("strong_curve_occurrence", 0)),
+            }
+        )
     return record
 
 
@@ -1513,12 +1556,20 @@ def _stat_fieldnames(thresholds_hours: Sequence[float]) -> list[str]:
 
 SITE_STAT_FIELDNAMES = tuple(_stat_fieldnames(LIFETIME_THRESHOLD_HOURS))
 
+SHARED_STRONG_STAT_COLUMNS = (
+    "shared_strong_core_s1_day", "shared_core_count_total", "shared_strong_core_count_total", "shared_strong_core_fraction",
+    "shared_strong_core_snapshots", "shared_strong_core_snapshot_rate", "shared_strong_curve_snapshots",
+)
+"""``--shared-strong-core-s1-day`` 時附加的 site_statistics 欄位：共用門檻、站內全部核心數、強核心數、強核心占比、
+至少有一個強核心（強核心曲線）的有效快照數（逐時產品即為小時數）與占有效快照比例。"""
+
 
 def site_stat_fieldnames(
     lifetime_thresholds_hours: Sequence[float] = LIFETIME_THRESHOLD_HOURS,
     *,
     with_null: bool = False,
     with_track_filter: bool = False,
+    with_shared_strong: bool = False,
 ) -> list[str]:
     """依壽命門檻設定產生 CSV 欄位；預設門檻等同 :data:`SITE_STAT_FIELDNAMES`。
 
@@ -1532,6 +1583,8 @@ def site_stat_fieldnames(
         names.append("track_core_filter_quantile")
     if with_null:
         names.extend(null_column_names(lifetime_thresholds_hours))
+    if with_shared_strong:
+        names.extend(SHARED_STRONG_STAT_COLUMNS)
     return names
 
 
@@ -1542,13 +1595,15 @@ def _write_site_statistics(
     *,
     with_null: bool = False,
     track_core_filter: Mapping[str, Any] | None = None,
+    with_shared_strong: bool = False,
 ) -> None:
     """寫出 long-format ``site_statistics.csv`` 與 ``site_statistics.json``。"""
 
     csv_path = output_dir / "site_statistics.csv"
     with csv_path.open("w", encoding="utf-8", newline="") as stream:
         fieldnames = site_stat_fieldnames(
-            lifetime_thresholds_hours, with_null=with_null, with_track_filter=track_core_filter is not None
+            lifetime_thresholds_hours, with_null=with_null, with_track_filter=track_core_filter is not None,
+            with_shared_strong=with_shared_strong,
         )
         writer = csv.DictWriter(stream, fieldnames=fieldnames)
         writer.writeheader()
@@ -1561,8 +1616,14 @@ def _write_site_statistics(
     _atomic_write_json(output_dir / "site_statistics.json", payload)
 
 
-def _finalize_spatial(shape: tuple[int, int], accumulator: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
-    """把逐格累加器轉成 NaN-safe 的頻率／平均欄位。"""
+def _finalize_spatial(
+    shape: tuple[int, int], accumulator: Mapping[str, np.ndarray], *, shared_strong: bool = False
+) -> dict[str, np.ndarray]:
+    """把逐格累加器轉成 NaN-safe 的頻率／平均欄位。
+
+    ``shared_strong=True``（``--shared-strong-core-s1-day``）時另輸出強核心曲線出現頻率與原始計數，供本機重選熱區門檻、重畫；
+    預設不輸出，npz 欄位與舊版完全相同。
+    """
 
     n_valid = accumulator["n_valid"]
     valid_gt0 = n_valid > 0
@@ -1576,7 +1637,7 @@ def _finalize_spatial(shape: tuple[int, int], accumulator: Mapping[str, np.ndarr
     np.divide(accumulator["core_s1_sum"], accumulator["core_count"], out=mean_core_s1, where=accumulator["core_count"] > 0)
     mean_lifetime = np.full(shape, np.nan, dtype=np.float64)
     np.divide(accumulator["lifetime_sum"], accumulator["lifetime_count"], out=mean_lifetime, where=accumulator["lifetime_count"] > 0)
-    return {
+    result = {
         "n_valid": n_valid,
         "core_frequency": core_frequency,
         "strong_core_frequency": strong_core_frequency,
@@ -1587,6 +1648,14 @@ def _finalize_spatial(shape: tuple[int, int], accumulator: Mapping[str, np.ndarr
         "track_count": np.asarray(accumulator["track_count"], dtype=np.int64),
         "long_track_count": np.asarray(accumulator["long_track_count"], dtype=np.int64),
     }
+    if shared_strong:
+        strong_curve_pass_frequency = np.full(shape, np.nan, dtype=np.float64)
+        np.divide(accumulator["strong_curve_pass_count"], n_valid, out=strong_curve_pass_frequency, where=valid_gt0)
+        result["strong_curve_pass_frequency"] = strong_curve_pass_frequency
+        result["strong_curve_pass_count"] = np.asarray(accumulator["strong_curve_pass_count"], dtype=np.int64)
+        result["strong_core_count"] = np.asarray(accumulator["strong_core_count"], dtype=np.int64)
+        result["core_count"] = np.asarray(accumulator["core_count"], dtype=np.int64)
+    return result
 
 
 def _mask_to_site(finalized: Mapping[str, np.ndarray], site_mask: np.ndarray) -> dict[str, np.ndarray]:
@@ -1629,6 +1698,19 @@ def _period_label(domain_context: Mapping[str, dict[str, Any]]) -> str:
     return f"{months[0]}-{months[-1]}"
 
 
+def _parse_figure_kinds(value: str | None) -> frozenset[str] | None:
+    """解析 ``--figure-kinds``：``None`` 代表全部；未知名稱直接拒絕，避免靜默少畫圖。"""
+
+    if value is None or not str(value).strip():
+        return None
+    kinds = frozenset(part.strip() for part in str(value).split(",") if part.strip())
+    known = {*FIGURE_KINDS, *EXAMPLE_FIGURE_KINDS, *TRACK_FIGURE_KINDS, *COASTAL_FIGURE_KINDS}
+    unknown = sorted(kinds - known)
+    if unknown:
+        raise ValueError(f"--figure-kinds 含未知圖種 {unknown}；可用：{sorted(known)}")
+    return kinds
+
+
 def _figure_relative_paths(site_id: str) -> list[str]:
     """一個站的成果圖相對路徑（``figures/<site_id>/site_<site_id>_<kind>.png``）：五張基本圖、WP-H 的五張，以及 WP-I 的
     ``example_coastal``（該站沒有近岸型長壽命 track 時不輸出）與 ``coastal_diagnostic``。"""
@@ -1652,6 +1734,38 @@ def _null_p99_hours(null_runs: Sequence[Mapping[str, Any]], site_id: str) -> flo
 
     pooled = [value for run in null_runs for value in run["lifetimes"].get(site_id, [])]
     return float(np.quantile(np.asarray(pooled, dtype=np.float64), 0.99)) if pooled else None
+
+
+def _long_track_colour_range(
+    born_records_by_site: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    long_track_hours: float,
+    nominal_step_hours: float,
+) -> dict[str, Any]:
+    """同一產品五站共用的 ``long_tracks`` 色階（只影響顏色對應，不改任何統計）。
+
+    色階下限為長壽命 track 門檻；上限為各站「壽命 >= 門檻」未截尾 track 的最長壽命，
+    再取五站最大值並進位到整齊刻度（天數產品為 10 天倍數、逐時產品為 12 小時倍數）。
+    回傳 ``vmin_hours``、``vmax_hours``（沒有任何長壽命 track 時為 ``None``，renderer
+    退回各站自己的上限）以及各站最長壽命，供 manifest 追溯。
+    """
+
+    from . import example_figures
+
+    per_site_max: dict[str, float | None] = {}
+    for site_id, records in born_records_by_site.items():
+        lifetimes = [float(item["lifetime_hours"]) for item in records if float(item["lifetime_hours"]) >= long_track_hours]
+        per_site_max[site_id] = max(lifetimes) if lifetimes else None
+    vmax = example_figures.shared_long_track_colour_max_hours(
+        [value for value in per_site_max.values() if value is not None], nominal_step_hours=nominal_step_hours
+    )
+    return {
+        "scope": "shared across all sites of this product",
+        "vmin_hours": float(long_track_hours),
+        "vmax_hours": vmax,
+        "rounding": "up to multiple of 10 days (day-unit products) or 12 h (hourly products)",
+        "per_site_max_lifetime_hours": per_site_max,
+    }
 
 
 def _render_site_wp_h_figures(
@@ -1678,6 +1792,7 @@ def _render_site_wp_h_figures(
     param_id: str,
     period_label: str,
     coast_buffer_m: float | None = None,
+    long_track_colour_max_hours: float | None = None,
 ) -> dict[str, Any]:
     """一個站的 WP-H／WP-I 圖：長壽命 track 路徑、track 通過數、傳播速度，以及（可選）代表 TRAP、近岸型代表與方法比較。
 
@@ -1738,6 +1853,7 @@ def _render_site_wp_h_figures(
         prop_stationary=fitted[:, 4] != 0.0,
         prop_resid_rms_m=fitted[:, 2],
         prop_min_obs=int(prop_min_obs),
+        colour_max_hours=long_track_colour_max_hours,
     )
     paths = list(
         example_figures.render_track_figures(
@@ -1772,6 +1888,99 @@ def _render_site_wp_h_figures(
         chosen, criterion = select_representative_track(
             born_records, max(lifetime_thresholds), coastal_buffer_m=coast_buffer_m, null_p99_hours=null_p99
         )
+        # 簡要報告的縮放代表圖：改用「核心距分析區外緣夠遠的最長壽命 track」（只影響呈現，不影響任何統計）。
+        from . import concise_style
+        from .vector_figures import vector_report_enabled
+
+        zoom_options = concise_style.example_zoom_options() if (vector_report_enabled() and concise_style.concise_enabled()) else None
+        zoom_info: dict[str, Any] | None = None
+        dump_dir = os.environ.get("TRAPS_EXAMPLE_CANDIDATE_DUMP")
+        if dump_dir and zoom_options is not None:
+            # 診斷用：輸出逐時代表圖候選 track 的特徵表（只讀；不影響任何統計或圖面）。
+            hotspot_source = figure_data.hotspot_curve_mask_filtered if figure_data.hotspot_curve_mask_filtered is not None else figure_data.hotspot_curve_mask
+            features = example_figures.hourly_candidate_features(
+                born_records, observations, grid["x_m_axis"], grid["y_m_axis"], np.asarray(hotspot_source, dtype=bool),
+                detect_root=detect_root, domain_id=domain_id, min_lifetime_hours=float(os.environ.get("TRAPS_EXAMPLE_DUMP_MIN_HOURS", "6")),
+            )
+            Path(dump_dir).mkdir(parents=True, exist_ok=True)
+            (Path(dump_dir) / f"{site_id}.json").write_text(
+                json.dumps(
+                    {
+                        "site_id": site_id,
+                        "strong_core_threshold_sinv": figure_data.records["all"].get("strong_core_threshold_sinv"),
+                        "n_born_uncensored": len(born_records),
+                        "candidates": features,
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+        if zoom_options is not None and zoom_options.get("mode") == "hourly":
+            # 逐時代表圖：熱點內／緊鄰、曲線清楚可見、壽命分層（只影響呈現，不影響任何統計）。
+            selection = {**example_figures.HOURLY_SELECTION_DEFAULTS, **{k: v for k, v in zoom_options.items() if k in example_figures.HOURLY_SELECTION_DEFAULTS}}
+            # 逐站覆寫（例如要求貢寮的代表 TRAP 靠近海岸）：選項檔 example_zoom.per_site.<站>。
+            selection.update({k: v for k, v in (zoom_options.get("per_site", {}).get(site_id, {})).items() if k in example_figures.HOURLY_SELECTION_DEFAULTS})
+            hotspot_source = figure_data.hotspot_curve_mask_filtered if figure_data.hotspot_curve_mask_filtered is not None else figure_data.hotspot_curve_mask
+            features = example_figures.hourly_candidate_features(
+                born_records, observations, grid["x_m_axis"], grid["y_m_axis"], np.asarray(hotspot_source, dtype=bool),
+                detect_root=detect_root, domain_id=domain_id, min_lifetime_hours=float(min(selection["tiers_hours"])),
+                later_fractions=zoom_options["later_fractions"],
+            )
+            site_mask_array = np.asarray(figure_data.site_mask, dtype=bool)
+            for item in features:
+                col0 = int(np.argmin(np.abs(np.asarray(grid["x_m_axis"], dtype=np.float64) - item["start_core_m"][0])))
+                row0 = int(np.argmin(np.abs(np.asarray(grid["y_m_axis"], dtype=np.float64) - item["start_core_m"][1])))
+                item["start_in_site"] = bool(site_mask_array[row0, col0])
+            if selection.get("require_window"):
+                # 視窗規則：含站點錨點與海岸線（只對通過其他條件的候選逐一尋找視窗）。
+                mapper_w = example_figures.MetricToLonLat(grid["x_m_axis"], grid["y_m_axis"], figure_data.lon, figure_data.lat)
+                domain_bbox = (float(np.min(figure_data.lon)), float(np.min(figure_data.lat)), float(np.max(figure_data.lon)), float(np.max(figure_data.lat)))
+                segments = example_figures.coast_segments(coastline, domain_bbox)
+                window_params = zoom_options.get("window_lattice")
+                coast_cache: dict[tuple[float, float], float] = {}
+                n_windowed = 0
+                for item in features:
+                    item["window"] = None
+                    if not item.get("curves") or not item["start_in_site"]:
+                        continue
+                    if float(item["start_dist_to_hotspot_km"]) > float(selection["hotspot_max_distance_km"]) + 1.0e-9:
+                        continue
+                    if float(item["max_offset_from_start_km"]) > float(selection["max_offset_km"]):
+                        continue
+                    bx0, by0, bx1, by1 = item["track_bbox_m"]
+                    lons_w, lats_w = mapper_w([bx0, bx1], [by0, by1])
+                    item["window"] = example_figures.find_example_window(
+                        (float(lons_w[0]), float(lats_w[0]), float(lons_w[1]), float(lats_w[1])), figure_data.anchor_lonlat,
+                        domain_bbox, segments, window_params, coast_cache=coast_cache,
+                    )
+                    n_windowed += item["window"] is not None
+            feature_chosen, zoom_info = example_figures.select_hourly_track(
+                features, n_born_uncensored=len(born_records), **selection
+            )
+            if feature_chosen is not None:
+                chosen_window = feature_chosen.get("window")
+                standard_frame_name = (zoom_options.get("window_lattice") or {}).get("standard_frame")
+                if chosen_window is not None and standard_frame_name:
+                    # 標準圖框（concise_style.FRAME_SPECS）：track 與原視窗已選定，只把入選視窗擴成規格跨度（案例不變）。
+                    chosen_window = example_figures.standardize_example_window(chosen_window, segments, str(standard_frame_name))
+                zoom_info["window"] = chosen_window
+                zoom_info["start_in_site"] = bool(feature_chosen.get("start_in_site", True))
+            chosen = None
+            if feature_chosen is not None:
+                chosen = next(item for item in born_records if int(item["track_id"]) == int(feature_chosen["track_id"]))
+                zoom_info["chosen_born_record"] = {k: (v if not isinstance(v, np.generic) else v.item()) for k, v in chosen.items()}
+                zoom_info["coastal_buffer_km"] = float(coast_buffer_m) / 1000.0 if coast_buffer_m is not None else None
+            criterion = "hourly_in_or_next_to_hotspot_clear_curve" if chosen is not None else "no_candidate"
+        elif zoom_options is not None:
+            chosen, zoom_info = example_figures.select_zoom_track(
+                born_records,
+                observations,
+                grid["x_m_axis"],
+                grid["y_m_axis"],
+                min_lifetime_hours=float(zoom_options["min_lifetime_days"]) * 24.0,
+                min_edge_km=zoom_options["min_edge_km"],
+            )
+            criterion = "zoom_longest_inside_domain" if chosen is not None else "no_candidate"
 
         def _prepare(item: Mapping[str, Any], item_criterion: str, variant: str) -> Any:
             return example_figures.prepare_example_snapshot(
@@ -1788,9 +1997,12 @@ def _render_site_wp_h_figures(
                 criterion=item_criterion,
                 coast_buffer_m=coast_buffer_m,
                 variant=variant,
+                **({"later_fractions": zoom_options["later_fractions"]} if (zoom_options is not None and variant == "main") else {}),
             )
 
         snapshot = _prepare(chosen, criterion, "main") if chosen is not None else None
+        if snapshot is not None and zoom_info is not None:
+            snapshot.zoom = dict(zoom_info)
         paths.extend(
             example_figures.render_snapshot_figures(
                 output_dir,
@@ -1813,6 +2025,8 @@ def _render_site_wp_h_figures(
                 "null_p99_lifetime_hours": null_p99,
             }
         )
+        if zoom_info is not None:
+            record["example"]["zoom"] = zoom_info
         if snapshot is not None:
             record["example"].update(
                 {
@@ -1831,7 +2045,7 @@ def _render_site_wp_h_figures(
                 }
             )
         coastal_record: dict[str, Any] = {"status": "none"}
-        if has_coast:
+        if has_coast and zoom_options is None:
             coastal_choice = select_coastal_track(born_records, float(coast_buffer_m))
             if coastal_choice is not None:
                 coastal_snapshot = _prepare(coastal_choice, "coastal_longest", "coastal")
@@ -1876,6 +2090,13 @@ def run_aggregate(args: argparse.Namespace) -> int:
     hotspot_quantile = float(args.hotspot_quantile)
     _require(0.0 < strong_quantile < 1.0, "--strong-quantile 必須介於 0 與 1 之間（不含端點）")
     _require(0.0 < hotspot_quantile < 1.0, "--hotspot-quantile 必須介於 0 與 1 之間（不含端點）")
+    shared_strong_raw = getattr(args, "shared_strong_core_s1_day", None)
+    shared_strong_day = None if shared_strong_raw is None else float(shared_strong_raw)
+    _require(
+        shared_strong_day is None or (np.isfinite(shared_strong_day) and shared_strong_day < 0.0),
+        "--shared-strong-core-s1-day 必須是有限的負數（day⁻¹，例如 -10）",
+    )
+    shared_strong_sinv = None if shared_strong_day is None else shared_strong_day / SECONDS_PER_DAY
     hotspot_min_cells = int(getattr(args, "hotspot_min_cells", HOTSPOT_MIN_CELLS))
     _require(hotspot_min_cells >= 1, "--hotspot-min-cells 必須 >= 1")
     raw_thresholds = getattr(args, "lifetime_thresholds_hours", None)
@@ -1913,6 +2134,7 @@ def run_aggregate(args: argparse.Namespace) -> int:
 
     figures_enabled = not bool(args.no_figures)
     example_figures_enabled = figures_enabled and not bool(getattr(args, "no_example_figures", False))
+    figure_kinds = _parse_figure_kinds(getattr(args, "figure_kinds", None))
     site_domain = {
         str(site["study_site_id"]): str(site["flow_domain_id"])
         for site in design["study_sites"]
@@ -2051,6 +2273,13 @@ def run_aggregate(args: argparse.Namespace) -> int:
 
     # --- Pass 1：各站自己的強核心門檻 ------------------------------------------------
     site_thresholds = _compute_site_thresholds(detect_root, domain_context, domain_masks, grids, strong_quantile)
+    reference_site_thresholds = site_thresholds
+    if shared_strong_sinv is not None:
+        # opt-in：五站共用同一個絕對強核心門檻，取代各站分位數門檻（分位數門檻保留在 manifest 供對照）
+        site_thresholds = {
+            site_id: {**item, "threshold_sinv": shared_strong_sinv, "threshold_day": shared_strong_day}
+            for site_id, item in reference_site_thresholds.items()
+        }
 
     # --- Pass 2：逐 domain 流式累加 --------------------------------------------------
     site_accumulators: dict[tuple[str, str], dict[str, Any]] = defaultdict(_new_site_accumulator)
@@ -2067,6 +2296,7 @@ def run_aggregate(args: argparse.Namespace) -> int:
             site_accumulators=site_accumulators,
             spatial_accumulators=spatial_accumulators,
             coast_buffer_m=coast_buffer_m,
+            shared_strong_sinv=shared_strong_sinv,
         )
         _process_track_lifetimes(
             context=domain_context[domain_id],
@@ -2117,7 +2347,7 @@ def run_aggregate(args: argparse.Namespace) -> int:
         hotspot_metrics_by_stratum: dict[str, dict[str, Any]] = {}
         for stratum in sorted(set(ordered) | {"all", *SEASONS}):
             accumulator = spatial_by_stratum.get(stratum) or _new_spatial_accumulator(shape)
-            finalized = _finalize_spatial(shape, accumulator)
+            finalized = _finalize_spatial(shape, accumulator, shared_strong=shared_strong_sinv is not None)
             hotspot = _site_hotspots(
                 accumulator, finalized, mask, cell_area_m2, hotspot_quantile, hotspot_min_cells, coast_buffer_mask=buffer_cells
             )
@@ -2140,6 +2370,7 @@ def run_aggregate(args: argparse.Namespace) -> int:
                     rng=rng,
                     lifetime_thresholds_hours=lifetime_thresholds,
                     coast_buffer_km=coastal_buffer_km,
+                    shared_strong_s1_day=shared_strong_day,
                 )
             )
             if track_core_filter is not None:
@@ -2165,7 +2396,10 @@ def run_aggregate(args: argparse.Namespace) -> int:
                 }
                 record.update(_null_group_columns(record, null_sets_by_group, lifetime_thresholds))
             records.append(record)
-    _write_site_statistics(output_dir, records, lifetime_thresholds, with_null=bool(null_runs), track_core_filter=track_core_filter)
+    _write_site_statistics(
+        output_dir, records, lifetime_thresholds, with_null=bool(null_runs), track_core_filter=track_core_filter,
+        with_shared_strong=shared_strong_sinv is not None,
+    )
 
     # --- 逐站 spatial npz ------------------------------------------------------------
     for site_id in sites_present:
@@ -2173,6 +2407,16 @@ def run_aggregate(args: argparse.Namespace) -> int:
         coast_field = np.asarray(grid["coast_distance_m"])
         site_coast_distance = np.where(site_mask[site_id], coast_field, np.nan).astype(np.float32)
         site_buffer_mask = site_mask[site_id] & (coast_field < coast_buffer_m)
+        shared_extras: dict[str, Any] = {}
+        if shared_strong_sinv is not None:
+            # 整個 flow domain 的距岸距離場與有效海域：本機重畫（近岸帶虛線、分析範圍外框、搭檔站淡化）不必再讀 SERVER 的 detect 輸出
+            shared_extras = {
+                "shared_strong_core_s1_day": np.float64(shared_strong_day),
+                "domain_coast_distance_m": np.asarray(coast_field, dtype=np.float32),
+                "domain_valid_sea_mask": np.logical_or.reduce(
+                    [np.asarray(m, dtype=bool) for m in domain_masks[site_domain[site_id]].values()]
+                ),
+            }
         for stratum in ("all", *SEASONS):
             hotspot = site_hotspots[site_id][stratum]
             threshold = site_thresholds[site_id]["threshold_sinv"]
@@ -2193,24 +2437,47 @@ def run_aggregate(args: argparse.Namespace) -> int:
                 coast_distance_m=site_coast_distance,
                 coast_buffer_mask=site_buffer_mask,
                 coast_buffer_m=np.float64(coast_buffer_m),
+                **shared_extras,
                 **site_spatial[site_id][stratum],
             )
 
     # --- 圖面 -------------------------------------------------------------------
     figure_paths: list[str] = []
     wp_h_manifest: dict[str, Any] = {}
+    long_track_colour_record: dict[str, Any] | None = None
     if figures_enabled:
         from . import aggregate_figures
 
         coastline, _coastline_meta = _resolve_coastline_geojson(args)
         period_label = _period_label(domain_context)
         record_index = {(str(r["site_id"]), str(r["stratum"])): r for r in records}
+        long_track_colour_record = _long_track_colour_range(
+            {
+                site_id: site_accumulators[(site_id, "all")]["born_uncensored"]
+                for site_id in sites_present
+            },
+            long_track_hours=long_track_hours,
+            nominal_step_hours=next(iter(domain_step_hours.values())),
+        )
         for site_id in sites_present:
             grid = grids[site_domain[site_id]]
             all_accumulator = site_accumulators[(site_id, "all")]
             age_count = int(all_accumulator["age_track_count"])
             evolution_mean_day = (
                 (all_accumulator["age_sum_sinv"] / age_count * SECONDS_PER_DAY).tolist() if age_count else []
+            )
+            # 同 flow domain 恰有另一個站（A 區的貢寮／龜山島）：簡要報告圖組據此畫出整個 domain 連續的場並淡化搭檔站範圍
+            partner_ids = [other for other in sites_present if other != site_id and site_domain[other] == site_domain[site_id]]
+            partner = (
+                {
+                    "site_id": partner_ids[0],
+                    "site_name_zh": site_name_zh.get(partner_ids[0], partner_ids[0]),
+                    "site_mask": site_mask[partner_ids[0]],
+                    "curve_pass_frequency": site_spatial[partner_ids[0]]["all"]["curve_pass_frequency"],
+                    "anchor_lonlat": site_anchor[partner_ids[0]],
+                }
+                if len(partner_ids) == 1
+                else None
             )
             figure_data = aggregate_figures.SiteFigureData(
                 site_id=site_id,
@@ -2267,6 +2534,7 @@ def run_aggregate(args: argparse.Namespace) -> int:
                 day_stats={day: list(row) for day, row in all_accumulator["day_stats"].items()},
                 anchor_lonlat=site_anchor[site_id],
                 n_valid_snapshots=int(all_accumulator["n_valid"]),
+                partner=partner,
             )
             figure_paths.extend(
                 aggregate_figures.render_site_figures(
@@ -2277,8 +2545,12 @@ def run_aggregate(args: argparse.Namespace) -> int:
                     state_label=shared["state_label"],
                     param_id=shared["param_id"],
                     period_label=period_label,
+                    kinds=figure_kinds,
                 )
             )
+            if figure_kinds is not None and not figure_kinds & {*EXAMPLE_FIGURE_KINDS, *TRACK_FIGURE_KINDS, "example_coastal"}:
+                # 局部重繪只要求基本圖時，不再重開 OCM snapshot 繪製 WP-H／WP-I 圖。
+                continue
             site_extra = _render_site_wp_h_figures(
                 output_dir=output_dir,
                 site_id=site_id,
@@ -2302,6 +2574,7 @@ def run_aggregate(args: argparse.Namespace) -> int:
                 param_id=shared["param_id"],
                 period_label=period_label,
                 coast_buffer_m=coast_buffer_m,
+                long_track_colour_max_hours=long_track_colour_record["vmax_hours"],
             )
             figure_paths.extend(site_extra["paths"])
             wp_h_manifest[site_id] = site_extra["manifest"]
@@ -2319,6 +2592,34 @@ def run_aggregate(args: argparse.Namespace) -> int:
         }
         for domain_id in present_domains
     }
+    record_index_all = {str(r["site_id"]): r for r in records if str(r["stratum"]) == "all"}
+    shared_strong_manifest: dict[str, Any] | None = None
+    if shared_strong_sinv is not None:
+        step_hours = float(next(iter(domain_step_hours.values())))
+        per_site: dict[str, Any] = {}
+        for site_id in sites_present:
+            record = record_index_all[site_id]
+            per_site[site_id] = {
+                "core_count_total": record["shared_core_count_total"],
+                "strong_core_count_total": record["shared_strong_core_count_total"],
+                "strong_core_fraction": record["shared_strong_core_fraction"],
+                "n_valid_snapshots": record["n_valid_snapshots"],
+                "strong_core_snapshots": record["shared_strong_core_snapshots"],
+                "strong_core_hours": record["shared_strong_core_snapshots"] * step_hours,
+                "strong_curve_snapshots": record["shared_strong_curve_snapshots"],
+                "qualified_core_count_pass1": reference_site_thresholds[site_id]["core_count"],
+                "reference_site_quantile_threshold_day": reference_site_thresholds[site_id]["threshold_day"],
+            }
+        shared_strong_manifest = {
+            "shared_strong_core_s1_day": shared_strong_day,
+            "shared_strong_core_s1_sinv": shared_strong_sinv,
+            "definition": "strong core: qualified core with s1 <= threshold, same threshold for all sites (replaces the per-site quantile threshold in strong_core_count, strong_core_frequency and strong-core site statistics)",
+            "strong_curve_definition": "curve pass count only counts detections whose own core s1 <= threshold (core location anywhere in the domain, pass cells clipped to the site mask)",
+            "nominal_step_hours": step_hours,
+            "per_site_quantile_threshold_replaced": True,
+            "track_statistics_note": "track lifetime/propagation columns still come from the existing track-root (per-site strong-quantile filter); TRACK was not rerun",
+            "sites": per_site,
+        }
     runtime_seconds = _time.monotonic() - start
     manifest = {
         "operation": "aggregate",
@@ -2365,6 +2666,7 @@ def run_aggregate(args: argparse.Namespace) -> int:
         "example_figures_enabled": example_figures_enabled,
         "surface_root_override": None if surface_root is None else str(surface_root),
         "site_track_figures": wp_h_manifest,
+        "long_track_colour_range": long_track_colour_record,
         "track_core_filter": track_core_filter,
         "lifetime_scope_zh": scope_text,
         "null_inputs": [
@@ -2386,11 +2688,13 @@ def run_aggregate(args: argparse.Namespace) -> int:
         },
         "bootstrap_reps": int(args.bootstrap_reps),
         "bootstrap_seed": int(args.seed),
+        **({"shared_strong_core": shared_strong_manifest} if shared_strong_manifest is not None else {}),
         "colour_limits": colour_limits,
         "inputs": inputs_record,
         "study_design_path": str(study_design_path),
         "study_design_sha256": _sha256_file(study_design_path),
         "figures_enabled": figures_enabled,
+        **({"figure_kinds_filter": sorted(figure_kinds)} if figure_kinds is not None else {}),
         "font": font_selection.as_manifest_dict() if font_selection is not None else None,
         "runtime_seconds": runtime_seconds,
         "created_at_utc": _datetime.datetime.now(_datetime.UTC).isoformat(timespec="seconds"),
@@ -2436,6 +2740,12 @@ def register_subcommands(subparsers: argparse._SubParsersAction) -> None:
     aggregate.add_argument("--study-design", type=Path, default=DEFAULT_STUDY_DESIGN_PATH)
     aggregate.add_argument(
         "--strong-quantile", type=float, default=0.10, help="各站自己的強核心 s1 分位數（不跨站 pooled），預設最強 10%%"
+    )
+    aggregate.add_argument(
+        "--shared-strong-core-s1-day", type=float, default=None, metavar="S1_DAY",
+        help="opt-in：五站共用同一個絕對強核心門檻（day⁻¹，負數，例如 -10）。給定時強核心判定（strong_core_count、strong_core_frequency、"
+        "強核心出現率）改用此門檻取代各站 --strong-quantile 分位數，並另外累計「強核心曲線通過次數」"
+        "（strong_curve_pass_frequency）與各站強核心數／占比，寫入 spatial npz、manifest 與 site_statistics；不給時行為與舊版相同",
     )
     aggregate.add_argument(
         "--hotspot-quantile", type=float, default=0.90, help="各站 curve_pass_frequency 的熱點分位數，預設最高 10%% 格點"
@@ -2486,6 +2796,11 @@ def register_subcommands(subparsers: argparse._SubParsersAction) -> None:
     aggregate.add_argument("--seed", type=int, default=20_260_928)
     aggregate.add_argument("--coastline-geojson", type=Path, help="成果圖 CRS84 海岸線 GeoJSON；未指定時使用專案預設檔")
     aggregate.add_argument("--no-figures", action="store_true", help="略過成果圖（也不需要 CJK 字型），只輸出統計表與 manifest")
+    aggregate.add_argument(
+        "--figure-kinds", default=None, metavar="KIND[,KIND...]",
+        help="只重繪指定圖種（逗號分隔，例如 lifetime）；預設全部。局部重繪的 manifest 不含完整圖檔，"
+        "只供取出該圖種，不可當作正式 aggregate 發布",
+    )
     aggregate.add_argument("--resume", action="store_true")
     aggregate.add_argument("--allow-partial-domains", action="store_true", help="允許 track-root 只有部分 domain")
     aggregate.set_defaults(handler=run_aggregate)

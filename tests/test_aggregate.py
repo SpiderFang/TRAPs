@@ -914,7 +914,11 @@ def test_render_site_figures_refuses_without_font(tmp_path: Path) -> None:
 
 @pytest.mark.filterwarnings("ignore")
 def test_all_figure_text_is_covered_by_required_glyph_set(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """實際畫在五張圖上的每個文字（去除 mathtext）都必須落在字型 gate 的必要字元集合內。"""
+    """實際畫在五張圖上的每個文字（去除 mathtext）都必須落在字型 gate 的必要字元集合內。
+
+    footer provenance 已由 manifest／報告保存，故此測試同時確認舊版期間、參數、
+    有效快照、OSM attribution 與字型資訊沒有回到成果圖底部。
+    """
 
     import matplotlib.figure
     import matplotlib.text
@@ -934,9 +938,16 @@ def test_all_figure_text_is_covered_by_required_glyph_set(tmp_path: Path, monkey
             state_label="PILOT_ONLY" if empty else "MODEL_ONLY", param_id="p", period_label="202401-202512", dpi=40,
         )
     assert any("貢寮" in text for text in collected)
-    assert any("MODEL_ONLY 表層短期吸引潛勢" in text for text in collected)
-    assert any("© OpenStreetMap contributors / ODbL" in text for text in collected)
-    assert any(FAKE_FONT.family in text for text in collected)
+    offending = [
+        (text, marker)
+        for text in collected
+        for marker in (
+            "期間 ", "param_id=", "有效快照 n=", "MODEL_ONLY 表層短期吸引潛勢", "PILOT_ONLY",
+            "© OpenStreetMap contributors / ODbL", FAKE_FONT.family,
+        )
+        if marker in text
+    ]
+    assert not offending, offending[:10]
     import re
 
     missing = set()
@@ -1057,7 +1068,7 @@ def test_aggregate_custom_lifetime_flags_end_to_end(built_run: tuple[Path, Path,
 
 @pytest.mark.filterwarnings("ignore")
 def test_map_figures_have_tight_layout_and_aligned_colorbars(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """熱點圖：色條與主圖等高、圖框由資料寬高比決定（寬扁地圖不會留下巨大空白）、註腳不壓到 axes。"""
+    """熱點圖：色條與主圖等高、保留座標內容且不再繪製 footer。"""
 
     import matplotlib.figure
     import matplotlib.text
@@ -1075,6 +1086,7 @@ def test_map_figures_have_tight_layout_and_aligned_colorbars(tmp_path: Path, mon
             captured["figure"] = self
             renderer = self.canvas.get_renderer()
             captured["footer"] = [t.get_window_extent(renderer) for t in self.texts if "n=" in t.get_text()]
+            captured["figure_texts"] = [t.get_text() for t in self.texts if t.get_text().strip()]
             captured["axes"] = [(a, a.get_position(), a.get_tightbbox(renderer)) for a in self.axes]
         return original_savefig(self, *args, **kwargs)
 
@@ -1085,11 +1097,11 @@ def test_map_figures_have_tight_layout_and_aligned_colorbars(tmp_path: Path, mon
     (main, main_pos, _), (cbar, cbar_pos, _) = captured["axes"]  # type: ignore[misc]
     assert cbar_pos.y0 == pytest.approx(main_pos.y0, abs=1e-3) and cbar_pos.height == pytest.approx(main_pos.height, abs=1e-3)
     assert main_pos.height > 0.3  # 地圖佔圖高的合理比例
-    footer_boxes = captured["footer"]
-    assert footer_boxes
-    for _axis, _pos, tight in captured["axes"]:  # type: ignore[misc]
-        for box in footer_boxes:  # type: ignore[attr-defined]
-            assert box.y1 <= tight.y0 + 1.0
+    assert main.get_xlabel() == report_font.FIGURE_TEXT["lon"]
+    assert main.get_ylabel() == report_font.FIGURE_TEXT["lat"]
+    assert cbar.get_ylabel() == f"{report_font.FIGURE_TEXT['curve_pass_frequency']} ({report_font.FIGURE_TEXT['fraction']})"
+    assert captured["footer"] == []
+    assert not any("param_id=" in text or "有效快照" in text for text in captured["figure_texts"])  # type: ignore[index]
 
 
 def _text_overlaps_in_lifetime_figure(tmp_path: Path, **overrides) -> tuple[list[tuple[str, str]], Path]:

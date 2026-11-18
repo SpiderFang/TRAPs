@@ -357,21 +357,24 @@ def test_coastal_figures_glyphs_buffer_legend_and_line_styles(tmp_path: Path, mo
         "site_gongliao_long_tracks.png", "site_gongliao_track_density.png",
     ):
         assert label in texts_by_figure[figure_name], figure_name
-    # 長壽命圖：近岸型（虛線）與近岸外圖例，以及近岸型／近岸外計數（實際與對照）
+    # 長壽命圖只保留近岸型（虛線）與近岸外圖例；實際／對照計數已留在資料與 manifest，
+    # 不應再以圖下方敘述佔用繪圖空間。
     long_texts = " ".join(texts_by_figure["site_gongliao_long_tracks.png"])
     assert FIGURE_TEXT["coastal_locked_legend"] in long_texts and FIGURE_TEXT["offshore_track_legend"] in long_texts
-    assert FIGURE_TEXT["long_coast_real"] in long_texts and FIGURE_TEXT["long_coast_null"] in long_texts
-    # 傳播圖：移動／靜止條數、靜止比例與殘差 RMS
+    assert FIGURE_TEXT["long_coast_real"] not in long_texts and FIGURE_TEXT["long_coast_null"] not in long_texts
+    # 傳播圖保留移動／靜止條數與比例；擬合方法及殘差摘要屬下方 metadata，應完全移除。
     prop_texts = " ".join(texts_by_figure["site_gongliao_propagation.png"])
     assert f"{FIGURE_TEXT['propagation_moving']} 3" in prop_texts and f"{FIGURE_TEXT['propagation_stationary']} 1" in prop_texts
-    assert FIGURE_TEXT["propagation_stationary_frac"] in prop_texts and FIGURE_TEXT["propagation_resid"] in prop_texts
+    assert FIGURE_TEXT["propagation_stationary_frac"] in prop_texts
+    assert FIGURE_TEXT["propagation_fit_note"].replace("{min_obs}", "7") not in prop_texts
+    assert FIGURE_TEXT["propagation_resid"] not in prop_texts
     # 近岸診斷圖：兩個子圖標題與分組圖例
     diag_texts = " ".join(texts_by_figure["site_gongliao_coastal_diagnostic.png"])
     for key in ("coast_hist_title", "coast_ccdf_title", "coast_hist_all", "coast_hist_strong", "coast_hist_long", "coast_offshore_real", "coast_coastal_null"):
         assert FIGURE_TEXT[key] in diag_texts, key
-    # 檢出下限標註與腳註；舊 shard 的最後一格以明確「≥ 30 km」標示
+    # 檢出下限仍以圖例保留；近岸診斷與長壽命成果都不再攜帶下方說明文字。
     assert f"{FIGURE_TEXT['coast_floor_a']} 2.6 km{FIGURE_TEXT['coast_floor_b']}" in diag_texts
-    assert FIGURE_TEXT["coast_footnote"] in diag_texts and FIGURE_TEXT["coast_footnote"] in long_texts
+    assert FIGURE_TEXT["coast_footnote"] not in diag_texts and FIGURE_TEXT["coast_footnote"] not in long_texts
     assert f"{FIGURE_TEXT['coast_cap_label']} 30 km" in diag_texts
 
 
@@ -601,7 +604,7 @@ def test_coastal_panel_a_has_no_free_text_and_floor_is_legend_entry(tmp_path: Pa
     legend = ax.get_legend()
     assert legend is not None
     legend_texts = [t.get_text() for t in legend.get_texts()]
-    assert any(t.startswith("檢出下限 ≈ 2.6 km") and "此範圍無法定位核心" in t for t in legend_texts)
+    assert any(t.startswith("檢出下限 ≈ 2.6 km") and "核心定位自此起算" in t for t in legend_texts)
     allowed = {id(ax.title), id(ax.xaxis.label), id(ax.yaxis.label), id(ax.xaxis.offsetText), id(ax.yaxis.offsetText)}
     allowed |= {id(t) for t in legend.findobj(matplotlib.text.Text)}
     fig.canvas.draw()
@@ -639,5 +642,9 @@ def test_propagation_footnote_uses_effective_min_obs(tmp_path: Path, monkeypatch
     )
     texts = [t for name, boxes in captured if Path(name).name.endswith("_propagation.png") for t, _ in boxes]
     joined = " ".join(texts)
+    # 有效觀測數仍是上方副標題的必要輸入條件；完整 fit note、殘差與 metadata
+    # 已移除，避免把描述文字放回圖下方或擠壓 xlabel。
     assert texts and "至少 3 個觀測" not in joined
-    assert "（至少 7 個觀測）" in joined and "{min_obs}" not in joined
+    assert "擬合至少 7 個觀測" in joined
+    assert FIGURE_TEXT["propagation_fit_note"].replace("{min_obs}", "7") not in joined
+    assert FIGURE_TEXT["propagation_resid"] not in joined

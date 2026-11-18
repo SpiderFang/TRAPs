@@ -315,6 +315,53 @@ def draw_geographic_coastline(
     return _draw_fragments(axis, fragments, color=color, linewidth=linewidth, zorder=zorder)
 
 
+LAND_FILL_COLOUR = "#d9d9d9"
+"""陸地填色（淺灰，與 Lagrangian-Ensemble-Backtracking 的流場範圍圖一致）；海岸線描邊畫在其上。"""
+
+
+def draw_land_fill(
+    axis: Any,
+    coastline: CoastlineGeometry,
+    *,
+    bbox: Sequence[float],
+    facecolor: str = LAND_FILL_COLOUR,
+    zorder: float = 0.5,
+) -> int:
+    """在經緯度軸上以 ``facecolor`` 填滿 bbox 內的陸地多邊形（只填色、不描邊；海岸線另由 :func:`draw_geographic_coastline` 疊在其上）。
+
+    海岸線檔的 ring 皆為外環（順時針、沒有內環），整批合成一條複合路徑以非零纏繞規則填色。與 bbox 不相交的 ring 略過，相交者以
+    ``Path.clip_to_bbox`` 裁到 bbox 內，向量輸出不帶整條台灣本島的頂點。回傳實際填色的 ring 數；不改動軸範圍。
+    """
+
+    from matplotlib.patches import PathPatch
+    from matplotlib.path import Path as MplPath
+    from matplotlib.transforms import Bbox
+
+    _require(isinstance(coastline, CoastlineGeometry), "coastline 必須是 CoastlineGeometry")
+    geographic_bbox = _validate_bbox(bbox)
+    clip_box = Bbox([[geographic_bbox[0], geographic_bbox[1]], [geographic_bbox[2], geographic_bbox[3]]])
+    vertices: list[np.ndarray] = []
+    codes: list[np.ndarray] = []
+    filled = 0
+    for ring in coastline.rings:
+        ring_min, ring_max = ring.min(axis=0), ring.max(axis=0)
+        if ring_max[0] < geographic_bbox[0] or ring_min[0] > geographic_bbox[2] or ring_max[1] < geographic_bbox[1] or ring_min[1] > geographic_bbox[3]:
+            continue
+        inside = bool(ring_min[0] >= geographic_bbox[0] and ring_max[0] <= geographic_bbox[2] and ring_min[1] >= geographic_bbox[1] and ring_max[1] <= geographic_bbox[3])
+        path = MplPath(ring, closed=True)
+        if not inside:
+            path = path.clip_to_bbox(clip_box)
+        if len(path.vertices) < 3:
+            continue
+        vertices.append(np.asarray(path.vertices, dtype=np.float64))
+        codes.append(np.asarray(path.codes, dtype=np.uint8) if path.codes is not None else np.r_[MplPath.MOVETO, [MplPath.LINETO] * (len(path.vertices) - 2), MplPath.CLOSEPOLY].astype(np.uint8))
+        filled += 1
+    if filled:
+        patch = PathPatch(MplPath(np.concatenate(vertices), np.concatenate(codes)), facecolor=facecolor, edgecolor="none", linewidth=0.0, zorder=zorder, clip_on=True)
+        axis.add_patch(patch)
+    return filled
+
+
 def _monotonic_axis(value: Any, *, name: str, from_grid: bool = False) -> np.ndarray:
     """取出一維且嚴格單調的軸；支援 OCM 的軸對齊二維 grid。"""
 

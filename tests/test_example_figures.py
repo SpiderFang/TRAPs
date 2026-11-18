@@ -316,19 +316,44 @@ def test_wp_h_figures_glyphs_and_no_text_overlap(tmp_path: Path, monkeypatch: py
     assert not missing, sorted(missing)
     for key in ("example_title", "method_note_streamline", "propagation_fit_note", "track_pass_note"):
         assert set(FIGURE_TEXT[key]) <= REQUIRED_FIGURE_GLYPHS
-    # 代表圖：圖例文字與註腳文字（及軸標籤）互不重疊
+
+    # 代表圖：圖例與經度軸標籤互不重疊；下方不得再出現 metadata、描述文字或 footer。
     name, boxes = next(item for item in captured if item[0].endswith("_example.png"))
     legend_labels = {FIGURE_TEXT["example_velocity"], FIGURE_TEXT["example_all_curves"], FIGURE_TEXT["example_chosen_curve"]}
     legend = [b for t, b in boxes if t in legend_labels]
-    footer = [b for t, b in boxes if "n=" in t or FIGURE_TEXT["science_model_only"] in t or "PILOT" in t or t.startswith("track ")]
     xlabel = [b for t, b in boxes if t == FIGURE_TEXT["lon"]]
+    example_texts = [t for t, _ in boxes]
+    method_texts = [t for n, bx in captured if n.endswith("_method_comparison.png") for t, _ in bx]
+    forbidden_footer_fragments = (
+        FIGURE_TEXT["footer_period"],
+        FIGURE_TEXT["science_model_only"],
+        FIGURE_TEXT["science_pilot_only"],
+        FIGURE_TEXT["footer_font"],
+        "param_id=",
+        "有效快照",
+        "OpenStreetMap",
+    )
+    for texts in (example_texts, method_texts):
+        assert not any(any(fragment in text for fragment in forbidden_footer_fragments) for text in texts)
     if not empty:
-        assert legend and footer and xlabel
-    for group_a, group_b in ((legend, footer), (legend, xlabel), (footer, xlabel)):
+        assert legend and xlabel
+        assert any(FIGURE_TEXT["example_birth"] in text and FIGURE_TEXT["example_lifetime"] in text for text in example_texts)
+        assert any(FIGURE_TEXT["example_birth"] in text and FIGURE_TEXT["example_lifetime"] in text for text in method_texts)
+        assert not any(text.startswith("track ") for text in (*example_texts, *method_texts))
+    else:
+        # 沒有合格代表 track 時仍須保留可辨識的資料不足狀態，而不是繪製假資料。
+        assert FIGURE_TEXT["example_no_track_short"] in example_texts
+        assert FIGURE_TEXT["example_no_track_short"] in method_texts
+    for group_a, group_b in ((legend, xlabel),):
         for a in group_a:
             for b in group_b:
                 assert not a.overlaps(b)
-    # 長壽命圖：超過 2000 條時標註，並附 null 平均
+
+    # 方法比較圖的紅色 notes 已移除；長壽命圖、track 密度圖及傳播圖也不應再帶 footer 文字。
+    assert not any(FIGURE_TEXT["method_note_streamline"] in text or FIGURE_TEXT["method_note_divergence"] in text for text in method_texts)
     long_texts = [t for n, bx in captured if n.endswith("_long_tracks.png") for t, _ in bx]
-    if not empty:
-        assert any(FIGURE_TEXT["long_capped_a"] in t for t in long_texts) and any(FIGURE_TEXT["null_long_mean"] in t for t in long_texts)
+    density_texts = [t for n, bx in captured if n.endswith("_track_density.png") for t, _ in bx]
+    propagation_texts = [t for n, bx in captured if n.endswith("_propagation.png") for t, _ in bx]
+    assert not any(FIGURE_TEXT["long_capped_a"] in text or FIGURE_TEXT["null_long_mean"] in text for text in long_texts)
+    assert not any(FIGURE_TEXT["track_pass_note"] in text for text in density_texts)
+    assert not any(FIGURE_TEXT["propagation_fit_note"] in text or FIGURE_TEXT["propagation_resid"] in text for text in propagation_texts)
