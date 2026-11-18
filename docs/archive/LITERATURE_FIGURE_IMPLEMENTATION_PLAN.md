@@ -32,4 +32,4 @@
 
 ## 最終驗收
 
-使用合成資料驗證空間分子／分母、分層 gate、觀測距離、粒子群凸包面積比及截尾；本機 2025-01-01 四區四時刻圖組見 [`outputs/pilot/literature_figures_four_area_4frames_v3/`](../../outputs/pilot/literature_figures_four_area_4frames_v3/figure_availability.json)。最終執行須目視檢查各圖、核對 manifest SHA-256 與缺觀測／潮相時的 `DATA_REQUIRED`；圖組仍需完整 2024–2025 資料及獨立表層觀測，才能形成正式研究結論。
+使用合成資料驗證空間分子／分母、分層 gate、觀測距離、粒子群凸包面積比及截尾；本機 2025-01-01 四區四時刻圖組見 [`outputs/_archive/pilot/literature_figures_four_area_4frames_v3/`](../../outputs/_archive/pilot/literature_figures_four_area_4frames_v3/figure_availability.json)。最終執行須目視檢查各圖、核對 manifest SHA-256 與缺觀測／潮相時的 `DATA_REQUIRED`；圖組仍需完整 2024–2025 資料及獨立表層觀測，才能形成正式研究結論。
