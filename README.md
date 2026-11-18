@@ -302,6 +302,6 @@ SERVER 用法見 `docs/operations/SERVER_RUNBOOK.md` 的 DAILY 一節（`TRAPS_F
 
 ## 目前產物、驗證與限制
 
-2024-01 至 2025-12 的全期分析已完成：逐時產品（`r1_hourly`）與 25 h 去潮汐日產品（`d1_daily25h`）各自完成 4 個流場區域 × 24 個月的偵測、追蹤與五站彙整（程式版本 `99c3151`），全套測試 254 項通過。方法與實作見 [`outputs/reports/01_TRAPs_實作方式報告.md`](outputs/reports/01_TRAPs_實作方式報告.md)，成果、圖與限制見 [`outputs/reports/02_TRAPs_執行成果報告.md`](outputs/reports/02_TRAPs_執行成果報告.md)；索引與引用方式見 [`outputs/reports/README.md`](outputs/reports/README.md)。早期 `PILOT_ONLY` 試算文件已歸檔於 [`docs/archive/`](docs/archive/IMPLEMENTATION_PLAN.md)，不代表目前結果。
+2024-01 至 2025-12 的全期分析已完成：逐時產品（`r1_hourly`）與 25 h 去潮汐日產品（`d1_daily25h`）各自完成 4 個流場區域 × 24 個月的偵測、追蹤與五站彙整（程式版本 `0f980cb`（改寫前為 `99c3151`）），全套測試 254 項通過。方法與實作見 [`outputs/reports/01_TRAPs_實作方式報告.md`](outputs/reports/01_TRAPs_實作方式報告.md)，成果、圖與限制見 [`outputs/reports/02_TRAPs_執行成果報告.md`](outputs/reports/02_TRAPs_執行成果報告.md)；索引與引用方式見 [`outputs/reports/README.md`](outputs/reports/README.md)。早期 `PILOT_ONLY` 試算文件已歸檔於 [`docs/archive/`](docs/archive/IMPLEMENTATION_PLAN.md)，不代表目前結果。
 
 限制：結果僅來自模型流場（`MODEL_ONLY`），沒有獨立的漂流器或海廢觀測驗證，只能稱為「表層短期吸引潛勢」，不得寫成海廢濃度、長期滯留、海底廢聚集或污染來源；日產品壽命的 2–3 天部分可由隨機串接解釋，近岸 2–3 km 內存在檢出下限。

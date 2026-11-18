@@ -69,7 +69,7 @@ SERVER：`mustlab@140.117.88.203`；工作區 `/home/mustlab/Workspace`。腳本
 （`PREPARE`／`DETECT` 會檢查 repo 乾淨，放進去會變髒），放在 `traps-runs/tools/`，用 `traps-repo` 的 `.venv` 與 `src`（唯讀 import）執行。
 所需的既有函式（`traps.period.curve_pass_cells`／`STOP_REASON_CODES`／`_canonical_valid_snapshot_indices_by_month`、
 `traps.aggregate._load_domain_grid`／`_build_domain_masks`／`_top_quantile_mask`／`_ragged_gather`、`traps.sites.load_study_design`）
-在 `traps-repo` 目前版本（cff6128，src 與 99c3151 相同）皆已存在，**不需要先同步其他檔案**。
+在 `traps-repo` 目前版本（cff6128，src 與 99c3151 相同；歷史改寫後分別為 d930398、0f980cb）皆已存在，**不需要先同步其他檔案**。
 
 ### 3.1 把腳本帶上 SERVER（在 Mac）
 

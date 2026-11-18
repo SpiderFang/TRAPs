@@ -17,7 +17,7 @@
 | 文件 | 狀態 | 說明 |
 | --- | --- | --- |
 | [outputs/reports/01_TRAPs_實作方式報告.md](../outputs/reports/01_TRAPs_實作方式報告.md) | 現行 | 方法與實作報告 |
-| [outputs/reports/02_TRAPs_執行成果報告.md](../outputs/reports/02_TRAPs_執行成果報告.md) | 現行 | 2024–2025 執行成果（commit `99c3151`） |
+| [outputs/reports/02_TRAPs_執行成果報告.md](../outputs/reports/02_TRAPs_執行成果報告.md) | 現行 | 2024–2025 執行成果（commit `0f980cb`（改寫前為 `99c3151`）） |
 | [outputs/reports/README.md](../outputs/reports/README.md) | 現行 | 報告索引與引用方式 |
 | [operations/SERVER_RUNBOOK.md](operations/SERVER_RUNBOOK.md) | 現行 | SERVER 部署與批次執行手冊 |
 | [archive/IMPLEMENTATION_PLAN.md](archive/IMPLEMENTATION_PLAN.md) | 歷史（pilot 階段） | 早期實作佇列與驗收界線 |
