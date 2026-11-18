@@ -106,3 +106,14 @@ docs/assets/traps_concept_literature_handoff/
 /tests/test_vicinity_20261027.py
 /tests/test_word_svg.py
 /tests/test_word_svg_png_fallback.py
+
+# Word report builders kept local (untracked 2026-11-18)
+/scripts/build_word_reports.py
+/scripts/check_word_report_numbers.py
+/scripts/generate_word_report_md.py
+/scripts/word_md_common.py
+/scripts/word_md_figures.py
+/scripts/word_md_localize.py
+/scripts/word_md_method.py
+/scripts/word_md_results.py
+/data/literature/manifest.json
